@@ -1,0 +1,30 @@
+name: CI
+
+# Runs on every push and PR so a broken build/test is caught before merge,
+# not after deploy.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      # No -DskipTests: a failing test must fail this job, not be
+      # silently bypassed to keep CI green.
+      - name: Build and test
+        run: mvn -B clean verify

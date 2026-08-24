@@ -1,0 +1,25 @@
+target/
+*.class
+
+# Local dev/testing output only — never used by the app itself
+local-output/
+
+.idea/
+*.iml
+
+# Local Claude Code tool config — machine-specific paths, not app config
+.claude/
+
+# Any local env file (.env, .env.compose, .env.local, ...) — never commit
+# real credentials. Keep the checked-in .example templates tracked.
+.env*
+!.env*.example
+
+# Terraform (** so this also catches nested infra subdirectories, not
+# just infra/ itself)
+infra/**/.terraform/
+infra/**/*.tfstate*
+infra/**/*.tfplan
+infra/**/.terraform.lock.hcl
+infra/**/*.tfvars
+!infra/**/*.tfvars.example

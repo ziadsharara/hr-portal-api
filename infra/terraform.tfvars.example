@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars (gitignored — never commit this file once
+# filled in with real values) and fill in before the first `terraform
+# apply`.
+
+# CIDR block allowed to reach the ALB — your office or VPN range.
+# NEVER 0.0.0.0/0: the API has no authentication yet. See variables.tf
+# and DEPLOYMENT.md for why this constraint exists.
+allowed_cidr = "203.0.113.4/32"
+
+github_repo_backend  = "your-org/hr-portal-api"
+github_repo_frontend = "your-org/hr-portal-frontend"

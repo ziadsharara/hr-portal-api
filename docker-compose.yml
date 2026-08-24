@@ -1,0 +1,75 @@
+# Local development stack ONLY. Not used for the AWS deployment — that
+# runs as separate ECS Fargate services/tasks defined in infra/. See
+# DEPLOYMENT.md.
+#
+# This file lives in the hr-portal-api repo but also builds the frontend
+# service from the sibling ../frontend checkout, since a useful local
+# stack needs both. An identical copy lives in frontend/docker-compose.yml
+# for people who clone that repo first — see the note in DEPLOYMENT.md if
+# the two ever need to be reconciled.
+#
+# Usage: cp .env.compose.example .env.compose, fill in local values, then
+#   docker compose --env-file .env.compose up --build
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: ${MYSQL_DATABASE}
+      MYSQL_USER: ${MYSQL_USER}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      # Exposed on the host only for local debugging with a DB client;
+      # not required for backend<->mysql communication (that uses the
+      # "mysql" service name over the compose-internal network).
+      - "${MYSQL_PORT:-3306}:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p${MYSQL_ROOT_PASSWORD}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      # The "prod" profile is env-var driven with no hardcoded values, so
+      # it's what both docker-compose (here) and ECS use — "prod" names
+      # the config style (externally configured), not literally the AWS
+      # production environment.
+      DB_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE}?useSSL=false&serverTimezone=UTC
+      DB_USERNAME: ${MYSQL_USER}
+      DB_PASSWORD: ${MYSQL_PASSWORD}
+    ports:
+      - "${BACKEND_PORT:-8080}:8080"
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      args:
+        # Relative path: the browser calls same-origin /api/..., and this
+        # container's nginx proxies that to the backend service below.
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/api}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    environment:
+      BACKEND_HOST: backend
+      BACKEND_PORT: "8080"
+    ports:
+      - "${FRONTEND_PORT:-5173}:8080"
+
+volumes:
+  mysql-data:

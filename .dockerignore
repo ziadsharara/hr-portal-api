@@ -1,0 +1,12 @@
+target/
+local-output/
+.git/
+.gitignore
+.idea/
+*.iml
+.claude/
+.vscode/
+*.md
+*.postman_collection.json
+Dockerfile
+.dockerignore
