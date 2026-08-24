@@ -1,5 +1,8 @@
 terraform {
-  required_version = ">= 1.7.0"
+  # 1.9 is the floor because api_allowed_cidrs' validation references
+  # another variable (allow_public_api_access), which earlier versions
+  # reject at parse time.
+  required_version = ">= 1.9.0"
 
   required_providers {
     aws = {
