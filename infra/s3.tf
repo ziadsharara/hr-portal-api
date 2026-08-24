@@ -71,13 +71,22 @@ data "aws_iam_policy_document" "frontend_read" {
     resources = ["${aws_s3_bucket.frontend.arn}/*"]
 
     # This condition is the entire access control on the frontend. The
-    # Vue bundle itself is not sensitive, but leaving the bucket open to
-    # the world would advertise the API's existence and endpoint to
-    # anyone who found it.
-    condition {
-      test     = "IpAddress"
-      variable = "aws:SourceIp"
-      values   = var.api_allowed_cidrs
+    # Vue bundle itself is not sensitive, but restricting it stops the
+    # bucket advertising the API's endpoint to anyone who finds it.
+    #
+    # Dropped entirely - not set to 0.0.0.0/0 - when public access is
+    # enabled. An IpAddress condition on aws:SourceIp only ever matches
+    # IPv4, so a 0.0.0.0/0 condition would still deny every visitor
+    # arriving over IPv6, which S3 website endpoints do serve. "Anyone"
+    # has to mean no condition at all.
+    dynamic "condition" {
+      for_each = var.allow_public_api_access ? [] : [1]
+
+      content {
+        test     = "IpAddress"
+        variable = "aws:SourceIp"
+        values   = var.api_allowed_cidrs
+      }
     }
   }
 }

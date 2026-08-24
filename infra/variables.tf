@@ -27,13 +27,24 @@ variable "project_name" {
 # machine that runs Terraform. Add a CIDR per demo location.
 #
 #   Find your current public IP with:  curl -s https://checkip.amazonaws.com
+# Opening this to the world is a decision, not a default. The guard below
+# is deliberately NOT just deleted when someone wants public access: it
+# requires allow_public_api_access to be flipped on as well, so that
+# "0.0.0.0/0" can never appear through carelessness, and so the next
+# person reading tfvars can see the exposure was chosen on purpose.
+variable "allow_public_api_access" {
+  type        = bool
+  description = "Permit 0.0.0.0/0 in api_allowed_cidrs. The API has NO authentication, so enabling this publishes the entire HR dataset - readable AND writable - to anyone who finds the address. Only defensible while the database holds no real data."
+  default     = false
+}
+
 variable "api_allowed_cidrs" {
   type        = list(string)
-  description = "CIDR blocks allowed to reach the backend API on EC2 and the frontend S3 website. The API has no authentication — this must never contain 0.0.0.0/0."
+  description = "CIDR blocks allowed to reach the backend API on EC2 and the frontend S3 website. 0.0.0.0/0 requires allow_public_api_access = true."
 
   validation {
-    condition     = !contains(var.api_allowed_cidrs, "0.0.0.0/0")
-    error_message = "api_allowed_cidrs must not contain 0.0.0.0/0 — the API has no authentication yet and this would expose the entire HR dataset to the internet. Use your own/office/VPN CIDR instead."
+    condition     = !contains(var.api_allowed_cidrs, "0.0.0.0/0") || var.allow_public_api_access
+    error_message = "api_allowed_cidrs contains 0.0.0.0/0, which exposes the unauthenticated HR API to the entire internet. If that is genuinely intended, set allow_public_api_access = true to acknowledge it explicitly."
   }
 
   validation {

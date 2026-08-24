@@ -39,11 +39,34 @@ control now lives in two places, and **both** must stay narrow:
   database. It is a separate variable on purpose, so that widening API
   access for a demo never silently widens shell access too.
 
-Both have no default and a validation rule that hard-fails
-`terraform plan`/`apply` on `0.0.0.0/0`. That is deliberate: it must not
-be possible to expose the HR dataset by omission. **Do not remove those
-rules to "just open it up for a demo"** until real authentication (Spring
-Security plus SSO/OAuth2) exists in the API.
+Both have no default. `ssh_allowed_cidr` still hard-fails on `0.0.0.0/0`
+with no way around it. `api_allowed_cidrs` accepts `0.0.0.0/0` only when
+`allow_public_api_access = true` is also set — a second, explicit switch,
+so the dataset cannot be exposed by omission and so anyone reading
+`terraform.tfvars` can see the exposure was chosen deliberately.
+
+**As currently deployed, `api_allowed_cidrs` is `["0.0.0.0/0"]`.** The
+app and the API are open to the entire internet, at the owner's explicit
+instruction, so the demo could be shown to people on other networks.
+
+What that means concretely, and it is worth being blunt about: there is
+no authentication, so anyone who finds the address can read every
+employee record, create and modify records, run the bulk Excel import,
+and export the full CV set. The `employees` table holds names, emails,
+phone numbers, home addresses, national ID numbers, dates of birth,
+gender, nationality and insurance numbers.
+
+This is only defensible because the database currently holds **zero
+rows**. Before a single real HR record is loaded, either add real
+authentication (Spring Security plus SSO/OAuth2) or set
+`api_allowed_cidrs` back to specific CIDRs and `allow_public_api_access`
+back to `false`. Loading real data while this stands is a reportable
+personal-data breach waiting to happen, not a configuration preference.
+
+Note also that when public access is on, the S3 bucket policy drops its
+`aws:SourceIp` condition entirely rather than setting it to `0.0.0.0/0`.
+An `IpAddress` condition only ever matches IPv4, so a `0.0.0.0/0`
+condition would still deny every visitor arriving over IPv6.
 
 Two things make this weaker than the ECS setup it replaced, and you
 should know both before treating this as anything but a dev/demo stack:
