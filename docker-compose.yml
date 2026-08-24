@@ -1,6 +1,7 @@
 # Local development stack ONLY. Not used for the AWS deployment — that
-# runs as separate ECS Fargate services/tasks defined in infra/. See
-# DEPLOYMENT.md.
+# runs the backend and MySQL as containers on a single EC2 instance
+# (infra/), and serves the frontend as static files from S3 rather than
+# from the nginx container below. See DEPLOYMENT.md.
 #
 # This file lives in the hr-portal-api repo but also builds the frontend
 # service from the sibling ../frontend checkout, since a useful local
@@ -22,6 +23,11 @@ services:
       MYSQL_PASSWORD: ${MYSQL_PASSWORD}
     volumes:
       - mysql-data:/var/lib/mysql
+      # Applied on first boot only, against an empty data directory. Same
+      # file the EC2 deployment uses, so local and deployed schemas cannot
+      # drift. To re-apply after editing it, you must drop the volume:
+      #   docker compose down -v
+      - ./db/init:/docker-entrypoint-initdb.d:ro
     ports:
       # Exposed on the host only for local debugging with a DB client;
       # not required for backend<->mysql communication (that uses the

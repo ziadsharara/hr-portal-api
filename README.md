@@ -6,15 +6,19 @@ system; the Vue SPA that consumes this API lives in the sibling repo
 [`hr-portal-frontend`](https://github.com/ziadsharara/hr-portal-frontend),
 normally checked out next to this repo as `../frontend`.
 
-## ⚠️ No authentication — read this before deploying anywhere reachable
+## WARNING - no authentication. Read this before deploying anywhere reachable
 
 **This API has no authentication or authorization of any kind.** Every
 endpoint — including bulk Excel import and full CV export — is open to
 whatever can reach it over the network. If you deploy this, the network
-boundary (e.g. an ALB security group restricted to a known CIDR — see
-[`DEPLOYMENT.md`](DEPLOYMENT.md)) is the *only* thing standing between
-the open internet and the full HR dataset. Do not expose this publicly
-until real authentication is added.
+boundary is the *only* thing standing between the open internet and the
+full HR dataset.
+
+In the current deployment that boundary is the EC2 security group and the
+S3 bucket policy, both governed by `api_allowed_cidrs`, which is
+validated to reject `0.0.0.0/0` — see [`DEPLOYMENT.md`](DEPLOYMENT.md).
+There is no load balancer, no CDN, and no TLS in front of it. Do not
+expose this publicly until real authentication is added.
 
 ## Tech stack
 
@@ -99,7 +103,7 @@ are the source of truth for the current endpoint contract.
 
 | Variable | Used by | Notes |
 |---|---|---|
-| `SPRING_PROFILES_ACTIVE` | prod/Docker/ECS | set to `prod` |
+| `SPRING_PROFILES_ACTIVE` | prod/Docker/EC2 | set to `prod` |
 | `DB_URL` | `prod` profile | e.g. `jdbc:mysql://host:3306/db?useSSL=false&serverTimezone=UTC` |
 | `DB_USERNAME` | `prod` profile | |
 | `DB_PASSWORD` | `prod` profile | |
@@ -110,8 +114,28 @@ For the full local Docker Compose stack (`MYSQL_ROOT_PASSWORD`,
 `BACKEND_PORT`, `FRONTEND_PORT`, `VITE_API_BASE_URL`), see
 [`.env.compose.example`](.env.compose.example).
 
+## Database schema
+
+`spring.jpa.hibernate.ddl-auto=none`, so nothing creates tables at
+runtime. The schema is [`db/init/01_schema.sql`](db/init/01_schema.sql),
+applied by the MySQL container's entrypoint on first boot only — the same
+file locally and on EC2.
+
+Note that this file was **reconstructed from the JPA entities**: the
+schema files this project's config refers to (`01_create_schema.sql`,
+`02_create_dev_schema.sql`) do not exist in this repo or its git history,
+so a fresh database previously had no schema at all. Read the header
+comment in it before trusting it in production. There is also no
+migration tool (no Flyway, no Liquibase), so editing that file does not
+migrate a running database.
+
 ## Deployment
 
-Full CI/CD and AWS (ECS/RDS/Terraform) story lives in
+Full CI/CD and AWS (EC2/S3/Terraform) story lives in
 [`DEPLOYMENT.md`](DEPLOYMENT.md) — start there, including the
 no-authentication warning and the required one-time AWS setup.
+
+In short: the backend and MySQL run as containers on a single EC2
+instance, with MySQL's data on a dedicated EBS volume and no published
+port; the Vue frontend is served as static files from S3. CD builds an
+image, pushes it to ECR, and redeploys over SSM Run Command.

@@ -11,39 +11,71 @@ variable "project_name" {
 }
 
 # --- Safety-critical: DO NOT set a default here ---------------------
-# The API has NO authentication as of this deployment. If this were
-# accidentally defaulted to 0.0.0.0/0, the ALB would expose the entire
-# HR dataset (names, employment data, everything the API serves) to the
-# open internet with zero access control. Leaving this required with no
-# default means `terraform plan`/`apply` HARD-FAILS until it's set
-# explicitly — it cannot be silently left open by omission.
+# The API has NO authentication as of this deployment. There is no
+# Cloudflare, no WAF, and no ALB in front of it any more — the EC2
+# security group below is now the ONLY control standing between the open
+# internet and the full HR dataset (names, employment data, bulk Excel
+# import, full CV export).
 #
-# Set to your office/VPN CIDR, e.g. "203.0.113.4/32" for a single IP or
-# "203.0.113.0/24" for a range. See DEPLOYMENT.md for how to set this
-# safely (terraform.tfvars, gitignored) and the constraint it enforces.
-variable "allowed_cidr" {
-  type        = string
-  description = "CIDR block allowed to reach the ALB (office/VPN only). The API has no authentication yet — this must never be 0.0.0.0/0."
+# Leaving this required with no default means `terraform plan`/`apply`
+# HARD-FAILS until it is set explicitly. It cannot be silently left open
+# by omission, and the validation rule rejects 0.0.0.0/0 outright.
+#
+# The browser is what calls this API: the Vue app is served from S3 but
+# every XHR goes directly to the EC2 public endpoint. So this list must
+# contain the public IP of whoever is *using* the demo, not just the
+# machine that runs Terraform. Add a CIDR per demo location.
+#
+#   Find your current public IP with:  curl -s https://checkip.amazonaws.com
+variable "api_allowed_cidrs" {
+  type        = list(string)
+  description = "CIDR blocks allowed to reach the backend API on EC2 and the frontend S3 website. The API has no authentication — this must never contain 0.0.0.0/0."
 
   validation {
-    condition     = var.allowed_cidr != "0.0.0.0/0"
-    error_message = "allowed_cidr must not be 0.0.0.0/0 — the API has no authentication yet and this would expose it to the entire internet. Use your office/VPN CIDR instead."
+    condition     = !contains(var.api_allowed_cidrs, "0.0.0.0/0")
+    error_message = "api_allowed_cidrs must not contain 0.0.0.0/0 — the API has no authentication yet and this would expose the entire HR dataset to the internet. Use your own/office/VPN CIDR instead."
   }
+
+  validation {
+    condition     = length(var.api_allowed_cidrs) > 0
+    error_message = "api_allowed_cidrs must list at least one CIDR — an empty list would make the deployment unreachable."
+  }
+}
+
+# --- Safety-critical: DO NOT set a default here ---------------------
+# SSH is a direct shell on the box that holds the database. Scoped to a
+# single CIDR, separate from api_allowed_cidrs, so that widening API
+# access for a demo never silently widens shell access too.
+variable "ssh_allowed_cidr" {
+  type        = string
+  description = "Single CIDR allowed to SSH to the EC2 instance (your IP only, e.g. \"203.0.113.4/32\")."
+
+  validation {
+    condition     = var.ssh_allowed_cidr != "0.0.0.0/0"
+    error_message = "ssh_allowed_cidr must not be 0.0.0.0/0 — this instance hosts the database. Use your own IP, e.g. \"203.0.113.4/32\"."
+  }
+}
+
+variable "ssh_key_name" {
+  type        = string
+  description = "Name of an existing EC2 key pair for SSH. Empty string disables SSH entirely — use SSM Session Manager instead (the instance profile already allows it), which needs no key, no open port 22, and no public IP."
+  default     = ""
 }
 
 # --- Required for the GitHub OIDC trust policies in iam_github_oidc.tf ---
 # hr-portal-api and hr-portal-frontend are separate GitHub repos with
 # their own CD workflows (cd.yml in each), so each gets its own deploy
-# role, scoped to only its own ECR repo + ECS service. Never wildcard
-# these, and never let one repo's role reach the other's resources.
+# role: the backend's can push to ECR and redeploy the EC2 instance, the
+# frontend's can only write to the S3 site bucket. Never wildcard these,
+# and never let one repo's role reach the other's resources.
 variable "github_repo_backend" {
   type        = string
-  description = "GitHub \"org/repo\" for the hr-portal-api backend, e.g. \"my-org/hr-portal-api\"."
+  description = "GitHub \"org/repo\" for the hr-portal-api backend, e.g. \"ziadsharara/hr-portal-api\"."
 }
 
 variable "github_repo_frontend" {
   type        = string
-  description = "GitHub \"org/repo\" for the hr-portal-frontend frontend, e.g. \"my-org/hr-portal-frontend\"."
+  description = "GitHub \"org/repo\" for the hr-portal-frontend frontend, e.g. \"ziadsharara/hr-portal-frontend\"."
 }
 
 variable "create_github_oidc_provider" {
@@ -54,11 +86,15 @@ variable "create_github_oidc_provider" {
 
 variable "github_deploy_branch" {
   type        = string
-  description = "Branch the CD deploy role's trust policy is scoped to (matches cd.yml's trigger branch)."
+  description = "Branch the CD deploy roles' trust policies are scoped to (matches cd.yml's trigger branch)."
   default     = "main"
 }
 
-# --- Database ---------------------------------------------------------
+# --- Database (MySQL container on the EC2 instance) -------------------
+# Not RDS. The database runs as a container beside the backend on the
+# same instance, with its data directory on a dedicated EBS volume so it
+# survives instance replacement. See ec2.tf and DEPLOYMENT.md for the
+# tradeoffs this carries versus the managed RDS instance it replaced.
 variable "db_name" {
   type    = string
   default = "hr_portal"
@@ -66,86 +102,47 @@ variable "db_name" {
 
 variable "db_username" {
   type        = string
-  description = "Master DB username. The password is generated by Terraform (random_password) and stored only in Secrets Manager — never set it here."
+  description = "Application DB username. The password is generated by Terraform (random_password) and stored only in Secrets Manager — never set it here."
   default     = "hr_portal_app"
 }
 
-variable "db_instance_class" {
+variable "db_engine_image" {
   type        = string
-  description = "Single instance, not Multi-AZ — acceptable cost/reliability tradeoff for an internal tool's first production deployment. Revisit (db.t4g.small+, multi_az=true) if uptime requirements grow."
-  default     = "db.t4g.micro"
+  description = "MySQL container image. The application is MySQL-specific (mysql-connector-j, jdbc:mysql:// URLs, hand-written schema DDL) — do not swap this for Postgres without migrating the application layer first."
+  default     = "mysql:8.0"
 }
 
-variable "db_allocated_storage_gb" {
+# --- EC2 -------------------------------------------------------------
+variable "instance_type" {
+  type        = string
+  description = "Runs both the Spring Boot container and the MySQL container, so it needs headroom for both. t3.small (2 GiB) is the practical floor; t3.micro (1 GiB) will OOM once the JVM and MySQL are both warm."
+  default     = "t3.small"
+}
+
+variable "backend_port" {
+  type        = number
+  description = "Host port the backend container publishes. MySQL deliberately publishes NO host port at all — see ec2.tf."
+  default     = 8080
+}
+
+variable "db_data_volume_size_gb" {
+  type        = number
+  description = "Size of the dedicated EBS volume holding MySQL's data directory, mounted at /var/lib/hr-portal/mysql."
+  default     = 20
+}
+
+variable "root_volume_size_gb" {
   type    = number
   default = 20
 }
 
-variable "db_engine_version" {
-  type    = string
-  default = "8.0"
-}
-
-# --- ECS sizing ---------------------------------------------------------
-# Small fixed sizes and desired_count=1 per service — an internal tool at
-# this scale doesn't need headroom for burst traffic or HA across AZs.
-# Bump desired_count to 2 first if you need zero-downtime deploys /
-# resilience to a single task crashing.
-variable "backend_container_port" {
-  type    = number
-  default = 8080
-}
-
-variable "frontend_container_port" {
-  type    = number
-  default = 8080
-}
-
-variable "backend_cpu" {
-  type    = number
-  default = 256
-}
-
-variable "backend_memory" {
-  type    = number
-  default = 512
-}
-
-variable "frontend_cpu" {
-  type    = number
-  default = 256
-}
-
-variable "frontend_memory" {
-  type    = number
-  default = 512
-}
-
-variable "desired_count" {
-  type    = number
-  default = 1
-}
-
 # --- Bootstrapping ---------------------------------------------------
-# The very first `terraform apply` has to register ECS task definitions
-# pointing at SOME image tag before any image has ever been pushed by
-# CD. ":latest" won't exist in ECR yet either on a brand-new repo — the
-# ECS service will sit in a failed-to-start loop until the first CD run
-# pushes real images. This is expected; see DEPLOYMENT.md's first-time
-# setup steps (apply, then manually trigger CD once).
+# The very first `terraform apply` boots the instance before CD has ever
+# pushed an image, so ":latest" will not exist in ECR yet on a brand-new
+# repository. The backend container will fail to start until the first CD
+# run pushes a real image. This is expected — see DEPLOYMENT.md's
+# first-time setup (apply, then trigger CD once).
 variable "container_image_tag" {
   type    = string
   default = "latest"
-}
-
-# --- Future HTTPS (not implemented in this pass) ---------------------
-# Left as an explicit empty-string TODO rather than silently omitted, so
-# it's obvious this was a deliberate deferral, not an oversight. Once a
-# domain is decided: request/validate an ACM cert, set this var to its
-# ARN, and add an HTTPS listener (443) + redirect the HTTP listener to
-# it in alb.tf.
-variable "acm_certificate_arn" {
-  type        = string
-  description = "TODO: ACM certificate ARN for HTTPS, once a domain exists. Empty = HTTP-only via the ALB's default DNS name (current state)."
-  default     = ""
 }

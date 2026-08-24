@@ -1,0 +1,211 @@
+#!/bin/bash
+# Bootstraps the HR Portal host: Docker, the MySQL data volume, and the
+# two containers. Rendered by ec2.tf's templatefile() — anything written
+# as $${VAR} here is a shell or Compose variable that survives into the
+# rendered script; a bare $${} would be a Terraform interpolation.
+#
+# cloud-init runs this ONCE, on first boot only. ec2.tf sets
+# user_data_replace_on_change so that editing it replaces the instance
+# rather than leaving a changed script silently unapplied.
+#
+# Output lands in /var/log/user-data.log (and cloud-init's own logs).
+set -euxo pipefail
+exec > >(tee -a /var/log/user-data.log) 2>&1
+
+APP_DIR=/opt/hr-portal
+DB_MOUNT=${db_mount_point}
+COMPOSE_PLUGIN_DIR=/usr/libexec/docker/cli-plugins
+
+# --- Packages ---------------------------------------------------------
+dnf update -y
+dnf install -y docker jq
+
+# AL2023 has no docker-compose-plugin package, so the v2 plugin binary is
+# installed by hand. Pinned rather than tracking "latest": a bootstrap
+# that silently changes version between two identical applies is not
+# reproducible.
+mkdir -p "$COMPOSE_PLUGIN_DIR"
+curl -fsSL \
+  "https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64" \
+  -o "$COMPOSE_PLUGIN_DIR/docker-compose"
+chmod +x "$COMPOSE_PLUGIN_DIR/docker-compose"
+
+systemctl enable --now docker
+
+# --- MySQL data volume ------------------------------------------------
+# The volume is attached by a separate Terraform resource, which can land
+# after the instance has already booted into this script — so wait for
+# the device instead of assuming it is present. On Nitro instances the
+# kernel names it /dev/nvme1n1 and AL2023's udev rules add the /dev/sdf
+# symlink; check both, since the symlink is not guaranteed to appear
+# first.
+DEVICE=""
+for _ in $(seq 1 60); do
+  for candidate in /dev/sdf /dev/nvme1n1; do
+    if [ -e "$candidate" ]; then
+      DEVICE="$candidate"
+      break 2
+    fi
+  done
+  sleep 5
+done
+
+if [ -z "$DEVICE" ]; then
+  echo "FATAL: data volume never appeared; refusing to start MySQL on the root volume" >&2
+  exit 1
+fi
+
+# Only format a genuinely blank device. blkid succeeding means there is
+# already a filesystem here — almost certainly the database from a
+# previous instance — and formatting it would destroy the HR dataset.
+if ! blkid "$DEVICE"; then
+  mkfs -t xfs "$DEVICE"
+fi
+
+mkdir -p "$DB_MOUNT"
+
+# Mount by UUID, not device path: Nitro device numbering is not stable
+# across reboots, so a /dev/sdf line in fstab can mount the wrong disk.
+UUID=$(blkid -s UUID -o value "$DEVICE")
+if ! grep -q "$UUID" /etc/fstab; then
+  echo "UUID=$UUID $DB_MOUNT xfs defaults,nofail 0 2" >> /etc/fstab
+fi
+mount -a
+
+# Verify the mount actually took. Without this check a failed mount would
+# leave MySQL writing to the root volume, where the data would be lost on
+# the next instance replacement with no warning.
+if ! mountpoint -q "$DB_MOUNT"; then
+  echo "FATAL: $DB_MOUNT is not a mountpoint after mount -a" >&2
+  exit 1
+fi
+
+# --- Credentials ------------------------------------------------------
+# Fetched at boot from Secrets Manager with the instance profile, never
+# baked into user data (which is readable by anything that can reach the
+# instance metadata service, and is stored in plaintext by EC2).
+mkdir -p "$APP_DIR"
+SECRET=$(aws secretsmanager get-secret-value \
+  --secret-id "${db_secret_arn}" \
+  --region "${aws_region}" \
+  --query SecretString --output text)
+
+# Written before the values go in, so the file is never briefly readable
+# by other users while it holds the password.
+touch "$APP_DIR/.env"
+chmod 600 "$APP_DIR/.env"
+chown root:root "$APP_DIR/.env"
+
+cat > "$APP_DIR/.env" <<EOF
+DB_NAME=$(echo "$SECRET" | jq -r .db_name)
+DB_USERNAME=$(echo "$SECRET" | jq -r .username)
+DB_PASSWORD=$(echo "$SECRET" | jq -r .password)
+DB_ROOT_PASSWORD=$(echo "$SECRET" | jq -r .root_password)
+IMAGE_TAG=${image_tag}
+EOF
+
+# --- Schema -----------------------------------------------------------
+# Applied by the MySQL entrypoint on first boot only, against an empty
+# data directory. Re-running this script against an existing volume will
+# not re-apply it.
+mkdir -p "$APP_DIR/db-init"
+cat > "$APP_DIR/db-init/01_schema.sql" <<'SCHEMA_EOF'
+${schema_sql}
+SCHEMA_EOF
+
+# --- Compose ----------------------------------------------------------
+cat > "$APP_DIR/docker-compose.yml" <<'COMPOSE_EOF'
+services:
+  mysql:
+    image: ${db_engine_image}
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: $${DB_ROOT_PASSWORD}
+      MYSQL_DATABASE: $${DB_NAME}
+      MYSQL_USER: $${DB_USERNAME}
+      MYSQL_PASSWORD: $${DB_PASSWORD}
+    volumes:
+      - ${db_mount_point}:/var/lib/mysql
+      - /opt/hr-portal/db-init:/docker-entrypoint-initdb.d:ro
+    # NO `ports:` STANZA, DELIBERATELY. MySQL binds only to the private
+    # Compose network, reachable by the backend container as the host
+    # "mysql" and by nothing else. Publishing 3306 would expose the HR
+    # database to whatever can reach this instance. Do not add one — to
+    # inspect the database, use:
+    #   docker compose -f /opt/hr-portal/docker-compose.yml exec mysql \
+    #     mysql -u root -p
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-p$${DB_ROOT_PASSWORD}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  backend:
+    image: ${ecr_repo_url}:$${IMAGE_TAG}
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      SPRING_PROFILES_ACTIVE: prod
+      # Points at the Compose service name over the private network, so
+      # this URL contains no routable host.
+      DB_URL: jdbc:mysql://mysql:3306/$${DB_NAME}?useSSL=false&serverTimezone=UTC
+      DB_USERNAME: $${DB_USERNAME}
+      DB_PASSWORD: $${DB_PASSWORD}
+    ports:
+      - "${backend_port}:8080"
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${aws_region}
+        awslogs-group: ${log_group}
+        awslogs-stream: backend
+COMPOSE_EOF
+
+# --- Deploy hook ------------------------------------------------------
+# cd.yml calls this over SSM Run Command with the new image tag. Kept as
+# a script on the box rather than inlined into the workflow so the deploy
+# steps live next to the thing they operate on, and so a human can run
+# the identical command by hand when a deploy needs redoing.
+cat > "$APP_DIR/deploy.sh" <<'DEPLOY_EOF'
+#!/bin/bash
+set -euo pipefail
+
+APP_DIR=/opt/hr-portal
+TAG="$${1:?usage: deploy.sh <image-tag>}"
+
+aws ecr get-login-password --region ${aws_region} \
+  | docker login --username AWS --password-stdin ${ecr_registry}
+
+# Rewrite only the IMAGE_TAG line; every other line in this file is a
+# credential that must survive the edit.
+sed -i "s|^IMAGE_TAG=.*|IMAGE_TAG=$${TAG}|" "$${APP_DIR}/.env"
+
+cd "$${APP_DIR}"
+docker compose pull backend
+docker compose up -d
+
+# Reclaim disk from superseded images. The root volume is small and every
+# deploy leaves the previous image behind; without this the box fills up
+# after a few dozen deploys and Docker starts failing to pull.
+docker image prune -f
+DEPLOY_EOF
+
+chmod +x "$APP_DIR/deploy.sh"
+
+# --- First start ------------------------------------------------------
+# On a brand-new ECR repository no image exists yet, so this pull fails
+# and the backend container will not start. That is expected on the very
+# first apply: MySQL still comes up and initialises the schema, and the
+# first CD run supplies a real image. Hence `|| true` — a missing image
+# must not fail the whole bootstrap and leave the volume unmounted.
+aws ecr get-login-password --region ${aws_region} \
+  | docker login --username AWS --password-stdin ${ecr_registry}
+
+cd "$APP_DIR"
+docker compose up -d mysql
+docker compose up -d backend || true
+
+echo "bootstrap complete"
