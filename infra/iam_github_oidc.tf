@@ -1,28 +1,28 @@
-# --- GitHub OIDC federation (Step 5's CD auth) -------------------------
+# --- GitHub OIDC federation --------------------------------------------
 # Lets GitHub Actions assume an AWS role using a short-lived token minted
 # per workflow run — no long-lived AWS access keys stored as GitHub
 # secrets. This is the AWS-recommended pattern specifically because it
 # removes the "leaked static credential" risk entirely.
 #
-# hr-portal-api and hr-portal-frontend are separate repos, each with
-# their own cd.yml, so each gets ITS OWN deploy role below — scoped to
-# only that service's ECR repo + ECS service. The backend's pipeline
-# cannot touch the frontend's resources and vice versa.
+# The two repos now deploy to completely different things, so their roles
+# have nothing in common any more:
+#
+#   backend  -> push to ECR, then trigger a redeploy on the one instance
+#   frontend -> write objects into the one S3 site bucket
+#
+# Neither can reach the other's resources, and neither can touch the
+# database secret.
 
 resource "aws_iam_openid_connect_provider" "github" {
   count = var.create_github_oidc_provider ? 1 : 0
 
   url            = "https://token.actions.githubusercontent.com"
   client_id_list = ["sts.amazonaws.com"]
+
   # This value is NOT security-critical: AWS has validated OIDC tokens
   # from this issuer against its own trusted CA bundle (not this field)
   # since 2023 — the thumbprint is a required-but-unused legacy field for
-  # well-known providers like GitHub's. It only needs to be a
-  # syntactically valid 40-hex-char SHA1 thumbprint. To recompute it from
-  # the live cert chain instead:
-  #   echo | openssl s_client -servername token.actions.githubusercontent.com \
-  #     -connect token.actions.githubusercontent.com:443 -showcerts 2>/dev/null \
-  #     | openssl x509 -noout -fingerprint -sha1 | cut -d= -f2 | tr -d ':'
+  # well-known providers like GitHub's.
   thumbprint_list = ["0fcba946366c27a9e22aeb82e6e8b49b172ce8d5"]
 
   tags = local.tags
@@ -46,6 +46,8 @@ resource "aws_iam_role" "github_deploy_backend" {
         StringEquals = {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
+        # Pinned to one repo AND one branch. Not a wildcard: any repo
+        # whose sub matched could otherwise mint these credentials.
         StringLike = {
           "token.actions.githubusercontent.com:sub" = "repo:${var.github_repo_backend}:ref:refs/heads/${var.github_deploy_branch}"
         }
@@ -70,7 +72,7 @@ resource "aws_iam_role_policy" "github_deploy_backend" {
         Resource = "*"
       },
       {
-        Sid    = "EcrPushPull"
+        Sid    = "EcrPushToBackendRepoOnly"
         Effect = "Allow"
         Action = [
           "ecr:BatchCheckLayerAvailability",
@@ -84,36 +86,30 @@ resource "aws_iam_role_policy" "github_deploy_backend" {
         Resource = [aws_ecr_repository.backend.arn]
       },
       {
-        Sid    = "EcsDescribeAndRegister"
+        # The deploy itself. Instead of an SSH key held as a GitHub
+        # secret, CD asks SSM to run the deploy script already on the
+        # box — so there is no inbound path from CI to the instance at
+        # all, and nothing to leak.
+        Sid    = "SsmRunDeployOnThisInstanceOnly"
         Effect = "Allow"
-        # ECS does not support resource-level scoping on these two
-        # actions (they act on a task definition family before a
-        # specific revision ARN exists) — this is the AWS-documented
-        # minimum, not an over-broad grant. RegisterTaskDefinition can't
-        # be scoped to "only the hr-portal-api family" at the IAM layer.
+        Action = ["ssm:SendCommand"]
+        Resource = [
+          aws_instance.backend.arn,
+          "arn:aws:ssm:${data.aws_region.current.name}::document/AWS-RunShellScript",
+        ]
+      },
+      {
+        # Reading back the result of the command CD just issued, so the
+        # workflow can fail when the deploy fails. These act on a command
+        # invocation ID that does not exist until SendCommand returns, so
+        # they cannot be scoped to a resource ARN.
+        Sid    = "SsmReadOwnCommandResult"
+        Effect = "Allow"
         Action = [
-          "ecs:DescribeTaskDefinition",
-          "ecs:RegisterTaskDefinition",
+          "ssm:GetCommandInvocation",
+          "ssm:ListCommandInvocations",
         ]
         Resource = "*"
-      },
-      {
-        Sid    = "EcsUpdateOwnServiceOnly"
-        Effect = "Allow"
-        Action = [
-          "ecs:UpdateService",
-          "ecs:DescribeServices",
-        ]
-        Resource = [aws_ecs_service.backend.id]
-      },
-      {
-        Sid      = "PassExecutionRoleToEcs"
-        Effect   = "Allow"
-        Action    = "iam:PassRole"
-        Resource  = aws_iam_role.ecs_task_execution.arn
-        Condition = {
-          StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" }
-        }
       },
     ]
   })
@@ -151,51 +147,23 @@ resource "aws_iam_role_policy" "github_deploy_frontend" {
     Version = "2012-10-17"
     Statement = [
       {
-        Sid      = "EcrAuth"
+        # ListBucket is on the bucket ARN; the object actions are on the
+        # keys within it. `aws s3 sync --delete` needs ListBucket to see
+        # what is already there and DeleteObject to remove what is gone.
+        Sid      = "ListSiteBucket"
         Effect   = "Allow"
-        Action   = ["ecr:GetAuthorizationToken"]
-        Resource = "*"
+        Action   = ["s3:ListBucket", "s3:GetBucketLocation"]
+        Resource = [aws_s3_bucket.frontend.arn]
       },
       {
-        Sid    = "EcrPushPull"
+        Sid    = "WriteSiteObjects"
         Effect = "Allow"
         Action = [
-          "ecr:BatchCheckLayerAvailability",
-          "ecr:GetDownloadUrlForLayer",
-          "ecr:BatchGetImage",
-          "ecr:InitiateLayerUpload",
-          "ecr:UploadLayerPart",
-          "ecr:CompleteLayerUpload",
-          "ecr:PutImage",
+          "s3:PutObject",
+          "s3:GetObject",
+          "s3:DeleteObject",
         ]
-        Resource = [aws_ecr_repository.frontend.arn]
-      },
-      {
-        Sid    = "EcsDescribeAndRegister"
-        Effect = "Allow"
-        Action = [
-          "ecs:DescribeTaskDefinition",
-          "ecs:RegisterTaskDefinition",
-        ]
-        Resource = "*"
-      },
-      {
-        Sid    = "EcsUpdateOwnServiceOnly"
-        Effect = "Allow"
-        Action = [
-          "ecs:UpdateService",
-          "ecs:DescribeServices",
-        ]
-        Resource = [aws_ecs_service.frontend.id]
-      },
-      {
-        Sid       = "PassExecutionRoleToEcs"
-        Effect    = "Allow"
-        Action    = "iam:PassRole"
-        Resource  = aws_iam_role.ecs_task_execution.arn
-        Condition = {
-          StringEquals = { "iam:PassedToService" = "ecs-tasks.amazonaws.com" }
-        }
+        Resource = ["${aws_s3_bucket.frontend.arn}/*"]
       },
     ]
   })

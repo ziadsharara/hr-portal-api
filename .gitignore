@@ -19,7 +19,11 @@ local-output/
 # just infra/ itself)
 infra/**/.terraform/
 infra/**/*.tfstate*
+# Both spellings: `-out=tfplan` produces a file with no extension, which
+# `*.tfplan` does not match. Plan files embed sensitive values (the
+# generated DB passwords among them), so a miss here leaks credentials.
 infra/**/*.tfplan
+infra/**/tfplan*
 infra/**/.terraform.lock.hcl
 infra/**/*.tfvars
 !infra/**/*.tfvars.example

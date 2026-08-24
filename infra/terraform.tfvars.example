@@ -1,11 +1,41 @@
-# Copy to terraform.tfvars (gitignored — never commit this file once
-# filled in with real values) and fill in before the first `terraform
-# apply`.
+# Copy to terraform.tfvars (gitignored — never commit it once filled in
+# with real values) and fill in before the first `terraform apply`.
 
-# CIDR block allowed to reach the ALB — your office or VPN range.
-# NEVER 0.0.0.0/0: the API has no authentication yet. See variables.tf
-# and DEPLOYMENT.md for why this constraint exists.
-allowed_cidr = "203.0.113.4/32"
+# --- Who can reach the deployment ------------------------------------
+# The API has NO authentication. There is no Cloudflare, no WAF, and no
+# ALB in this architecture — these CIDRs are the only access control on
+# the entire HR dataset.
+#
+# The browser running the Vue app calls the EC2 API directly, so this
+# must include the public IP of whoever is USING the demo, not just the
+# machine running Terraform. Add one entry per demo location.
+#
+# Find your current public IP:  curl -s https://checkip.amazonaws.com
+#
+# 0.0.0.0/0 is rejected by a validation rule in variables.tf. That is
+# intentional — do not remove it to "just open it for a demo".
+api_allowed_cidrs = ["203.0.113.4/32"]
 
-github_repo_backend  = "your-org/hr-portal-api"
-github_repo_frontend = "your-org/hr-portal-frontend"
+# Shell access to the box that holds the database. Kept separate from
+# api_allowed_cidrs so that widening API access never widens this.
+ssh_allowed_cidr = "203.0.113.4/32"
+
+# Leave empty to disable SSH entirely (no key pair, port 22 never opened)
+# and use SSM Session Manager instead:
+#   aws ssm start-session --target <backend_instance_id>
+# Set it to an existing EC2 key pair name only if you specifically want
+# key-based SSH.
+ssh_key_name = ""
+
+# --- GitHub OIDC trust ------------------------------------------------
+github_repo_backend  = "ziadsharara/hr-portal-api"
+github_repo_frontend = "ziadsharara/hr-portal-frontend"
+
+# Set to false if token.actions.githubusercontent.com is already
+# registered as an OIDC provider in this AWS account (AWS allows only
+# one per issuer URL, so a second `apply` would fail on a duplicate).
+# create_github_oidc_provider = true
+
+# --- Optional overrides -----------------------------------------------
+# aws_region    = "us-east-1"
+# instance_type = "t3.small"   # t3.micro will OOM: JVM + MySQL on one box
