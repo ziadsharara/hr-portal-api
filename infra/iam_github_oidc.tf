@@ -30,6 +30,27 @@ resource "aws_iam_openid_connect_provider" "github" {
 
 locals {
   github_oidc_provider_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : "arn:aws:iam::${data.aws_caller_identity.current.account_id}:oidc-provider/token.actions.githubusercontent.com"
+
+  # Both accepted `sub` forms per repo — see the comment on
+  # github_owner_id in variables.tf for why there are two. StringLike
+  # takes a list with OR semantics, so this permits exactly these
+  # strings and nothing else; there is no wildcard in either.
+  backend_owner  = split("/", var.github_repo_backend)[0]
+  backend_name   = split("/", var.github_repo_backend)[1]
+  frontend_owner = split("/", var.github_repo_frontend)[0]
+  frontend_name  = split("/", var.github_repo_frontend)[1]
+
+  github_ids_known = var.github_owner_id != ""
+
+  backend_subs = compact([
+    "repo:${var.github_repo_backend}:ref:refs/heads/${var.github_deploy_branch}",
+    local.github_ids_known && var.github_repo_backend_id != "" ? "repo:${local.backend_owner}@${var.github_owner_id}/${local.backend_name}@${var.github_repo_backend_id}:ref:refs/heads/${var.github_deploy_branch}" : "",
+  ])
+
+  frontend_subs = compact([
+    "repo:${var.github_repo_frontend}:ref:refs/heads/${var.github_deploy_branch}",
+    local.github_ids_known && var.github_repo_frontend_id != "" ? "repo:${local.frontend_owner}@${var.github_owner_id}/${local.frontend_name}@${var.github_repo_frontend_id}:ref:refs/heads/${var.github_deploy_branch}" : "",
+  ])
 }
 
 # --- Backend deploy role ------------------------------------------------
@@ -49,7 +70,7 @@ resource "aws_iam_role" "github_deploy_backend" {
         # Pinned to one repo AND one branch. Not a wildcard: any repo
         # whose sub matched could otherwise mint these credentials.
         StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_repo_backend}:ref:refs/heads/${var.github_deploy_branch}"
+          "token.actions.githubusercontent.com:sub" = local.backend_subs
         }
       }
     }]
@@ -84,6 +105,16 @@ resource "aws_iam_role_policy" "github_deploy_backend" {
           "ecr:PutImage",
         ]
         Resource = [aws_ecr_repository.backend.arn]
+      },
+      {
+        # CD resolves the instance from its Name tag rather than trusting
+        # a hardcoded ID in a repository variable, so replacing the
+        # instance does not silently break deploys. DescribeInstances has
+        # no resource-level scoping in EC2.
+        Sid      = "DiscoverBackendInstance"
+        Effect   = "Allow"
+        Action   = ["ec2:DescribeInstances"]
+        Resource = "*"
       },
       {
         # The deploy itself. Instead of an SSH key held as a GitHub
@@ -130,7 +161,7 @@ resource "aws_iam_role" "github_deploy_frontend" {
           "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
         }
         StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:${var.github_repo_frontend}:ref:refs/heads/${var.github_deploy_branch}"
+          "token.actions.githubusercontent.com:sub" = local.frontend_subs
         }
       }
     }]

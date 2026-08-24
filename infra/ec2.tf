@@ -23,7 +23,11 @@ resource "aws_eip_association" "backend" {
 # user_data edit) does not destroy the database. This volume is the only
 # stateful thing in the deployment.
 resource "aws_ebs_volume" "db_data" {
-  availability_zone = aws_instance.backend.availability_zone
+  # From the subnet, NOT from aws_instance.backend — see the comment on
+  # data.aws_subnet.selected. Taking it from the instance made every
+  # instance replacement cascade into replacing this volume, which is
+  # exactly the outcome prevent_destroy below exists to stop.
+  availability_zone = data.aws_subnet.selected.availability_zone
   size              = var.db_data_volume_size_gb
   type              = "gp3"
   encrypted         = true
@@ -47,7 +51,7 @@ resource "aws_volume_attachment" "db_data" {
 resource "aws_instance" "backend" {
   ami                    = data.aws_ssm_parameter.al2023_ami.value
   instance_type          = var.instance_type
-  subnet_id              = data.aws_subnets.default.ids[0]
+  subnet_id              = data.aws_subnet.selected.id
   vpc_security_group_ids = [aws_security_group.ec2.id]
   iam_instance_profile   = aws_iam_instance_profile.ec2.name
 

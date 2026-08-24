@@ -78,6 +78,48 @@ variable "github_repo_frontend" {
   description = "GitHub \"org/repo\" for the hr-portal-frontend frontend, e.g. \"ziadsharara/hr-portal-frontend\"."
 }
 
+# --- GitHub OIDC subject claim IDs ------------------------------------
+# GitHub has begun issuing OIDC tokens whose `sub` claim embeds immutable
+# numeric IDs:
+#
+#   repo:<owner>@<owner_id>/<repo>@<repo_id>:ref:refs/heads/<branch>
+#
+# rather than the long-documented plain form:
+#
+#   repo:<owner>/<repo>:ref:refs/heads/<branch>
+#
+# This was found the hard way: the first CD run failed with "Not
+# authorized to perform sts:AssumeRoleWithWebIdentity", and CloudTrail
+# showed the presented sub carrying the IDs while the trust policy
+# matched only the plain form.
+#
+# Setting these makes the trust policy accept BOTH forms, so it works
+# whichever GitHub sends. Leave them empty to allow only the plain form.
+# Pinning the IDs is the stronger of the two: numeric IDs survive a
+# rename, so an attacker cannot claim a freed-up owner or repo name and
+# inherit the trust.
+#
+# Find them with:
+#   gh api users/<owner>       --jq .id
+#   gh api repos/<owner>/<repo> --jq .id
+variable "github_owner_id" {
+  type        = string
+  description = "Numeric GitHub account ID of the repositories' owner. Empty disables the ID-bearing sub form."
+  default     = ""
+}
+
+variable "github_repo_backend_id" {
+  type        = string
+  description = "Numeric GitHub repository ID for the backend repo."
+  default     = ""
+}
+
+variable "github_repo_frontend_id" {
+  type        = string
+  description = "Numeric GitHub repository ID for the frontend repo."
+  default     = ""
+}
+
 variable "create_github_oidc_provider" {
   type        = bool
   description = "Whether to create the GitHub Actions OIDC identity provider. AWS allows only one provider per issuer URL per account — set this to false if token.actions.githubusercontent.com is already registered (e.g. by another repo's Terraform)."
@@ -113,6 +155,23 @@ variable "db_engine_image" {
 }
 
 # --- EC2 -------------------------------------------------------------
+# PIN THIS ONCE DEPLOYED, and do not change it afterwards.
+#
+# This subnet decides the availability zone, and the database volume
+# lives in that zone. An EBS volume cannot move between zones, so
+# changing this value asks Terraform to destroy and recreate the volume —
+# i.e. to delete the HR database. prevent_destroy on the volume turns
+# that into a failed apply rather than data loss, but the way to avoid
+# the situation entirely is to leave this alone.
+#
+# Empty picks the lowest-sorted subnet in the default VPC, which is fine
+# for a first apply into a fresh account and wrong for every apply after.
+variable "subnet_id" {
+  type        = string
+  description = "Subnet for the instance; also fixes the AZ of the database volume. Pin it after the first apply — changing it cannot move the volume."
+  default     = ""
+}
+
 variable "instance_type" {
   type        = string
   description = "Runs both the Spring Boot container and the MySQL container, so it needs headroom for both. t3.small (2 GiB) is the practical floor; t3.micro (1 GiB) will OOM once the JVM and MySQL are both warm."

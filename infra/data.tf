@@ -13,6 +13,22 @@ data "aws_subnets" "default" {
   }
 }
 
+# The one subnet everything lands in, resolved independently of any
+# resource. This exists to break a dependency that quietly endangered the
+# database: when the EBS volume took its availability_zone from
+# aws_instance.backend, any change forcing an instance replacement made
+# the AZ "known after apply", which in turn forced the VOLUME to be
+# replaced — destroying the HR data as a side effect of, say, editing the
+# bootstrap script. Reading the AZ from the subnet instead means the
+# volume no longer depends on the instance at all.
+#
+# sort() because aws_subnets returns IDs in no guaranteed order, and an
+# unstable [0] would silently migrate the instance to a different subnet
+# (and therefore a different AZ) on some later apply.
+data "aws_subnet" "selected" {
+  id = var.subnet_id != "" ? var.subnet_id : sort(data.aws_subnets.default.ids)[0]
+}
+
 data "aws_caller_identity" "current" {}
 
 data "aws_region" "current" {}

@@ -79,18 +79,48 @@ jobs:
       # key for this repo to hold, no inbound path from CI to the
       # instance, and port 22 can stay shut entirely. The script being
       # invoked was placed on the box by Terraform's user data.
+      # Resolved from the Name tag rather than read from a repository
+      # variable. Terraform replaces this instance whenever its bootstrap
+      # changes, which would leave a hardcoded EC2_INSTANCE_ID pointing at
+      # a terminated box — deploys would then fail, or worse, silently
+      # target nothing. The tag is stable across replacements; the ID is
+      # not. EC2_INSTANCE_ID is still honoured as a fallback.
+      - name: Resolve target instance
+        run: |
+          set -euo pipefail
+
+          RESOLVED=$(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=hr-portal-backend" \
+                      "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text)
+
+          # More than one match means an ambiguous target; deploying to an
+          # arbitrary one of them would be worse than failing here.
+          COUNT=$(echo "$RESOLVED" | wc -w | tr -d ' ')
+          if [ "$COUNT" -gt 1 ]; then
+            echo "Multiple running instances tagged hr-portal-backend: $RESOLVED" >&2
+            exit 1
+          fi
+
+          if [ -z "$RESOLVED" ] || [ "$RESOLVED" = "None" ]; then
+            RESOLVED="${INSTANCE_ID:-}"
+            echo "Tag lookup found nothing; falling back to EC2_INSTANCE_ID."
+          fi
+
+          if [ -z "$RESOLVED" ]; then
+            echo "No running instance tagged hr-portal-backend, and EC2_INSTANCE_ID is unset." >&2
+            exit 1
+          fi
+
+          echo "INSTANCE_ID=$RESOLVED" >> "$GITHUB_ENV"
+          echo "Targeting $RESOLVED"
+
       - name: Trigger redeploy via SSM
         id: send
         env:
           TAG: ${{ needs.build-and-push.outputs.image-tag }}
         run: |
           set -euo pipefail
-
-          if [ -z "${INSTANCE_ID:-}" ]; then
-            echo "EC2_INSTANCE_ID repository variable is not set." >&2
-            echo "Set it to Terraform's backend_instance_id output." >&2
-            exit 1
-          fi
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \

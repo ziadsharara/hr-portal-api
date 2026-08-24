@@ -151,7 +151,19 @@ services:
       SPRING_PROFILES_ACTIVE: prod
       # Points at the Compose service name over the private network, so
       # this URL contains no routable host.
-      DB_URL: jdbc:mysql://mysql:3306/$${DB_NAME}?useSSL=false&serverTimezone=UTC
+      #
+      # allowPublicKeyRetrieval=true is required, not optional: MySQL 8
+      # defaults to the caching_sha2_password plugin, and over a non-TLS
+      # connection Connector/J must fetch the server's RSA public key to
+      # encrypt the password. It refuses to do so unless told to, and the
+      # app dies at startup with "Public Key Retrieval is not allowed".
+      #
+      # The usual objection is that this lets a MITM serve a forged key.
+      # That is not reachable here: this connection never leaves the host,
+      # it runs over the private Compose bridge between two containers,
+      # and MySQL publishes no port. If TLS is ever enabled on the DB
+      # connection, drop this flag rather than keeping both.
+      DB_URL: jdbc:mysql://mysql:3306/$${DB_NAME}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
       DB_USERNAME: $${DB_USERNAME}
       DB_PASSWORD: $${DB_PASSWORD}
     ports:
