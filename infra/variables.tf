@@ -148,10 +148,10 @@ variable "db_username" {
   default     = "hr_portal_app"
 }
 
-variable "db_engine_image" {
+variable "db_image_tag" {
   type        = string
-  description = "MySQL container image. The application is MySQL-specific (mysql-connector-j, jdbc:mysql:// URLs, hand-written schema DDL) — do not swap this for Postgres without migrating the application layer first."
-  default     = "mysql:8.0"
+  description = "Tag of the hr-portal-db image (aws_ecr_repository.db, built from db/image/Dockerfile) to run. That image is MySQL 8.0 plus db/init/01_schema.sql and db/seed/01_seed_demo_data.sql baked in as init scripts — do not swap the base image for Postgres without migrating the application layer first (mysql-connector-j, jdbc:mysql:// URLs, hand-written schema DDL)."
+  default     = "latest"
 }
 
 # --- EC2 -------------------------------------------------------------

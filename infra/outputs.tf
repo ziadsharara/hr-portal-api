@@ -27,6 +27,11 @@ output "ecr_backend_repository_url" {
   value = aws_ecr_repository.backend.repository_url
 }
 
+output "ecr_db_repository_url" {
+  description = "Push the demo-data MySQL image (db/image/Dockerfile) here — see db/image/README.md."
+  value       = aws_ecr_repository.db.repository_url
+}
+
 output "github_deploy_role_arn_backend" {
   description = "Set this as the AWS_DEPLOY_ROLE_ARN repository variable in the hr-portal-api repo's GitHub settings."
   value       = aws_iam_role.github_deploy_backend.arn

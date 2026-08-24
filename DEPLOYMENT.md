@@ -63,7 +63,9 @@ EC2 endpoint. Find an IP with `curl -s https://checkip.amazonaws.com`.
 
 ## What moving off RDS gave up
 
-The database is now a `mysql:8.0` container on the same instance as the
+The database is now a container (`hr-portal-db` — MySQL 8.0 plus the
+schema and demo dataset baked in as init scripts, see
+[`db/image/README.md`](db/image/README.md)) on the same instance as the
 application, with its data directory on a dedicated EBS volume. Relative
 to the RDS instance this replaced:
 

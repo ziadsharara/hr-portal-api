@@ -90,7 +90,7 @@ resource "aws_instance" "backend" {
     # authorise the pull.
     ecr_registry    = split("/", aws_ecr_repository.backend.repository_url)[0]
     image_tag       = var.container_image_tag
-    db_engine_image = var.db_engine_image
+    db_engine_image = "${aws_ecr_repository.db.repository_url}:${var.db_image_tag}"
     backend_port    = var.backend_port
     log_group       = aws_cloudwatch_log_group.backend.name
     db_mount_point  = local.db_mount_point
