@@ -39,3 +39,8 @@ github_repo_frontend = "ziadsharara/hr-portal-frontend"
 # --- Optional overrides -----------------------------------------------
 # aws_region    = "us-east-1"
 # instance_type = "t3.small"   # t3.micro will OOM: JVM + MySQL on one box
+
+# Pin this after the first apply to whatever subnet the instance landed
+# in. The database volume lives in that subnet's AZ and cannot move
+# zones, so changing this later asks Terraform to recreate the volume.
+# subnet_id = "subnet-0123456789abcdef0"

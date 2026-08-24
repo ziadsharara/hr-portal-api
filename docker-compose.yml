@@ -54,7 +54,13 @@ services:
       # it's what both docker-compose (here) and ECS use — "prod" names
       # the config style (externally configured), not literally the AWS
       # production environment.
-      DB_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE}?useSSL=false&serverTimezone=UTC
+      # allowPublicKeyRetrieval=true is required against MySQL 8: it
+      # defaults to caching_sha2_password, and over a non-TLS connection
+      # Connector/J must fetch the server's RSA public key to encrypt the
+      # password. Without it the app dies at startup with "Public Key
+      # Retrieval is not allowed". Safe here because the connection never
+      # leaves the Compose network.
+      DB_URL: jdbc:mysql://mysql:3306/${MYSQL_DATABASE}?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
       DB_USERNAME: ${MYSQL_USER}
       DB_PASSWORD: ${MYSQL_PASSWORD}
     ports:
