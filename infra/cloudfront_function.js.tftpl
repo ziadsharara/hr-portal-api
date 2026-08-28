@@ -1,0 +1,79 @@
+// Templated by cloudfront.tf's templatefile() call from var.api_allowed_cidrs
+// — this is the ONLY place that list is compiled into JS, so there is one
+// source of truth for who may reach the frontend. Runs on viewer-request,
+// so it gates cached responses too, not just origin fetches.
+//
+// This replaces the aws:SourceIp condition the S3 bucket policy used to
+// carry back when the bucket was public (see s3.tf) — CloudFront doesn't
+// support that condition, and by the time a request reaches S3 from
+// CloudFront it no longer carries the end user's IP.
+//
+// IPv4 only. The distribution has is_ipv6_enabled = false, so an IPv6
+// viewer address here should not occur; if one ever does, ipToInt returns
+// null and the request is denied, not silently allowed.
+function handler(event) {
+    var request = event.request;
+    var viewerIp = event.viewer.ip;
+    var allowedCidrs = [
+%{ for cidr in cidrs ~}
+        "${cidr}",
+%{ endfor ~}
+    ];
+
+    for (var i = 0; i < allowedCidrs.length; i++) {
+        if (ipInCidr(viewerIp, allowedCidrs[i])) {
+            return request;
+        }
+    }
+
+    return {
+        statusCode: 403,
+        statusDescription: "Forbidden",
+        body: {
+            encoding: "text",
+            data: "Forbidden"
+        }
+    };
+}
+
+function ipInCidr(ip, cidr) {
+    var parts = cidr.split("/");
+    var prefixLength = parseInt(parts[1], 10);
+
+    if (isNaN(prefixLength) || prefixLength < 0 || prefixLength > 32) {
+        return false;
+    }
+
+    var ipInt = ipToInt(ip);
+    var baseInt = ipToInt(parts[0]);
+
+    if (ipInt === null || baseInt === null) {
+        return false;
+    }
+
+    var mask = prefixLength === 0 ? 0 : (0xFFFFFFFF << (32 - prefixLength)) >>> 0;
+
+    return (ipInt & mask) === (baseInt & mask);
+}
+
+function ipToInt(ip) {
+    var octets = ip.split(".");
+
+    if (octets.length !== 4) {
+        return null;
+    }
+
+    var result = 0;
+
+    for (var i = 0; i < 4; i++) {
+        var octet = parseInt(octets[i], 10);
+
+        if (isNaN(octet) || octet < 0 || octet > 255) {
+            return null;
+        }
+
+        result = (result << 8) | octet;
+    }
+
+    return result >>> 0;
+}

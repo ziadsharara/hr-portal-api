@@ -1,11 +1,16 @@
 output "frontend_url" {
-  description = "The Vue app. HTTP only — an S3 website endpoint cannot serve HTTPS. Reachable only from api_allowed_cidrs."
-  value       = "http://${aws_s3_bucket_website_configuration.frontend.website_endpoint}"
+  description = "The Vue app, served over HTTPS via CloudFront (default *.cloudfront.net certificate — no custom domain yet). Reachable only from api_allowed_cidrs, enforced by the CloudFront Function in cloudfront.tf."
+  value       = "https://${aws_cloudfront_distribution.frontend.domain_name}"
 }
 
 output "frontend_bucket_name" {
   description = "Set this as the S3_BUCKET repository variable in the hr-portal-frontend repo's GitHub settings."
   value       = aws_s3_bucket.frontend.bucket
+}
+
+output "cloudfront_distribution_id" {
+  description = "Set this as the CLOUDFRONT_DISTRIBUTION_ID repository variable in the hr-portal-frontend repo's GitHub settings — CD uses it to invalidate the cache after each deploy."
+  value       = aws_cloudfront_distribution.frontend.id
 }
 
 output "api_base_url" {

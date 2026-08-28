@@ -1,14 +1,12 @@
-# --- Frontend: S3 static website hosting ------------------------------
+# --- Frontend: private S3 bucket behind CloudFront ---------------------
 # Replaces the frontend's ECS service, ECR repo, and nginx container. CD
 # in hr-portal-frontend runs `npm run build` and syncs dist/ here.
 #
-# WARNING - HTTP ONLY. An S3 website endpoint cannot serve HTTPS. That is
-# the direct cost of dropping Cloudflare from the architecture: there is
-# no TLS anywhere in this deployment, so all traffic (including anything
-# the HR app displays) crosses the network in plaintext. Acceptable only
-# because api_allowed_cidrs keeps this to known networks in a
-# development/demo environment. Putting CloudFront or Cloudflare back in
-# front is what fixes it — see DEPLOYMENT.md.
+# The bucket is private — CloudFront (cloudfront.tf) is the only reader,
+# via Origin Access Control, and is what serves HTTPS to the browser. This
+# used to be a public S3 website endpoint (HTTP only, IP-restricted by a
+# bucket-policy aws:SourceIp condition) — see cloudfront.tf and
+# DEPLOYMENT.md for why that changed and what replaced the IP allowlist.
 
 resource "aws_s3_bucket" "frontend" {
   # Bucket names are globally unique across all AWS accounts, so the
@@ -19,74 +17,44 @@ resource "aws_s3_bucket" "frontend" {
   tags = local.tags
 }
 
-resource "aws_s3_bucket_website_configuration" "frontend" {
-  bucket = aws_s3_bucket.frontend.id
-
-  index_document {
-    suffix = "index.html"
-  }
-
-  # Vue Router runs in history mode, so a hard refresh of a client-side
-  # route like /employees/42 arrives at S3 as a key that does not exist.
-  # Serving index.html for those lets the router take over instead of
-  # showing S3's XML error document.
-  #
-  # The tradeoff: S3 returns HTTP 404 with this body, not 200. The app
-  # renders correctly, but genuinely missing assets are indistinguishable
-  # from routes at the status-code level. CloudFront custom error
-  # responses are what fix that properly, if this ever grows a CDN.
-  error_document {
-    key = "index.html"
-  }
-}
-
-# S3 website endpoints do not support origin access identities or bucket
-# policies scoped to a CDN — the objects must be readable by the caller
-# directly. So the public access block is relaxed just enough to attach a
-# policy, and the policy itself is what does the restricting via an
-# IpAddress condition.
+# Fully blocking public access is safe here (and correct) even though a
+# bucket policy is attached below: that policy grants only the
+# cloudfront.amazonaws.com service principal, scoped to this one
+# distribution's ARN — AWS does not classify that as "public" the way a
+# "*" principal is.
 resource "aws_s3_bucket_public_access_block" "frontend" {
   bucket = aws_s3_bucket.frontend.id
 
-  block_public_acls  = true
-  ignore_public_acls = true
-  # Both must be false for the IP-conditioned policy below to attach at
-  # all: AWS classifies any policy with a "*" principal as public,
-  # regardless of the conditions narrowing it.
-  block_public_policy     = false
-  restrict_public_buckets = false
+  block_public_acls       = true
+  ignore_public_acls      = true
+  block_public_policy     = true
+  restrict_public_buckets = true
 }
 
 data "aws_iam_policy_document" "frontend_read" {
   statement {
-    sid     = "PublicReadFromAllowedCidrsOnly"
+    sid     = "AllowCloudFrontReadOnly"
     effect  = "Allow"
     actions = ["s3:GetObject"]
 
     principals {
-      type        = "*"
-      identifiers = ["*"]
+      type        = "Service"
+      identifiers = ["cloudfront.amazonaws.com"]
     }
 
     resources = ["${aws_s3_bucket.frontend.arn}/*"]
 
-    # This condition is the entire access control on the frontend. The
-    # Vue bundle itself is not sensitive, but restricting it stops the
-    # bucket advertising the API's endpoint to anyone who finds it.
-    #
-    # Dropped entirely - not set to 0.0.0.0/0 - when public access is
-    # enabled. An IpAddress condition on aws:SourceIp only ever matches
-    # IPv4, so a 0.0.0.0/0 condition would still deny every visitor
-    # arriving over IPv6, which S3 website endpoints do serve. "Anyone"
-    # has to mean no condition at all.
-    dynamic "condition" {
-      for_each = var.allow_public_api_access ? [] : [1]
-
-      content {
-        test     = "IpAddress"
-        variable = "aws:SourceIp"
-        values   = var.api_allowed_cidrs
-      }
+    # Scopes the grant to this one distribution specifically — not "any
+    # CloudFront distribution in this account". This is a structural
+    # requirement (only CloudFront may ever read the bucket) and stays in
+    # place regardless of allow_public_api_access — the visitor-facing
+    # decision of who may reach the *site* now lives entirely in the
+    # CloudFront Function (cloudfront.tf), which is conditionally attached
+    # based on that variable instead of duplicating the toggle here.
+    condition {
+      test     = "StringEquals"
+      variable = "AWS:SourceArn"
+      values   = [aws_cloudfront_distribution.frontend.arn]
     }
   }
 }
@@ -95,8 +63,6 @@ resource "aws_s3_bucket_policy" "frontend" {
   bucket = aws_s3_bucket.frontend.id
   policy = data.aws_iam_policy_document.frontend_read.json
 
-  # Attaching a "public" policy fails if the access block is still in
-  # place, and Terraform does not infer this ordering on its own.
   depends_on = [aws_s3_bucket_public_access_block.frontend]
 }
 

@@ -9,8 +9,10 @@ as static files to S3.
 
     Browser
       |
-      +--> S3 website endpoint ............... the Vue bundle (static files)
-      |      http://<bucket>.s3-website.<region>.amazonaws.com
+      +--> CloudFront (HTTPS) ................ the Vue bundle (static files)
+      |      https://<distribution>.cloudfront.net
+      |      |
+      |      +--> S3 bucket (private, OAC) .... only CloudFront can read it
       |
       +--> EC2 Elastic IP :8080 .............. the API (cross-origin XHR)
                 |
@@ -19,11 +21,11 @@ as static files to S3.
                        |
                        +-- /var/lib/hr-portal/mysql -> dedicated EBS volume
 
-There is no load balancer, no CDN, no DNS, and no TLS. The two public
-surfaces are the S3 website endpoint and the instance's Elastic IP, and
-both are restricted by `api_allowed_cidrs`.
+There is no load balancer, no DNS, and no custom domain. The frontend has
+a CDN (CloudFront) and TLS; the backend does not — the API's Elastic IP
+is still plain HTTP, restricted by `api_allowed_cidrs`.
 
-## WARNING - no authentication, and now nothing in front of it
+## WARNING - no authentication, and mostly nothing in front of it
 
 **The API has no authentication or authorization of any kind.** Every
 endpoint, including bulk Excel import and full CV export, is open to
@@ -34,7 +36,13 @@ control protecting the HR dataset. That is still true in shape, but the
 control now lives in two places, and **both** must stay narrow:
 
 - `api_allowed_cidrs` (`infra/variables.tf`) governs the EC2 security
-  group **and** the S3 bucket policy's `aws:SourceIp` condition.
+  group **and** the CloudFront Function (`infra/cloudfront_function.js.tftpl`)
+  that gates the frontend at the edge. The frontend's S3 bucket is
+  private now (Origin Access Control) — CloudFront is the only reader,
+  and the Function is what stands in for the old bucket-policy
+  `aws:SourceIp` condition, since CloudFront doesn't support that
+  condition and a request reaching S3 from CloudFront no longer carries
+  the end user's IP.
 - `ssh_allowed_cidr` governs shell access to the box that holds the
   database. It is a separate variable on purpose, so that widening API
   access for a demo never silently widens shell access too.
@@ -63,26 +71,31 @@ authentication (Spring Security plus SSO/OAuth2) or set
 back to `false`. Loading real data while this stands is a reportable
 personal-data breach waiting to happen, not a configuration preference.
 
-Note also that when public access is on, the S3 bucket policy drops its
-`aws:SourceIp` condition entirely rather than setting it to `0.0.0.0/0`.
-An `IpAddress` condition only ever matches IPv4, so a `0.0.0.0/0`
-condition would still deny every visitor arriving over IPv6.
+Note also that when public access is on, the CloudFront Function that
+gates the frontend isn't attached to the distribution at all, rather than
+being fed `0.0.0.0/0` — an `IpAddress`-style check only ever matches
+IPv4, so a `0.0.0.0/0` allowlist would still deny every visitor arriving
+over IPv6 (the distribution's `is_ipv6_enabled` follows the same flag, so
+IPv6 is only turned on once there's no allowlist left for it to bypass).
 
 Two things make this weaker than the ECS setup it replaced, and you
 should know both before treating this as anything but a dev/demo stack:
 
-1. **There is no TLS anywhere.** S3 website endpoints cannot serve
-   HTTPS, and nothing terminates TLS on the instance. All traffic,
-   including whatever HR data the app displays, crosses the network in
-   plaintext. Restoring a CDN (CloudFront or Cloudflare) in front of both
-   surfaces is what fixes this.
+1. **The API has no TLS.** CloudFront now covers the frontend (see
+   `infra/cloudfront.tf`), but nothing terminates TLS on the EC2
+   instance — every request from the browser straight to the API's
+   Elastic IP still crosses the network in plaintext, including whatever
+   HR data comes back in the response. Putting CloudFront (or an ALB) in
+   front of the API too is what would fix this; not done yet since it
+   needs its own answer for the IP-allowlist-at-the-edge problem
+   `cloudfront_function.js.tftpl` solves for the frontend.
 2. **The database is no longer managed.** See "What moving off RDS gave
    up" below.
 
 `api_allowed_cidrs` must contain the public IP of **whoever is using the
 demo**, not just the machine that runs Terraform: the Vue app is served
-from S3, but every API call goes from the user's browser straight to the
-EC2 endpoint. Find an IP with `curl -s https://checkip.amazonaws.com`.
+from CloudFront, but every API call goes from the user's browser straight
+to the EC2 endpoint. Find an IP with `curl -s https://checkip.amazonaws.com`.
 
 ## What moving off RDS gave up
 
@@ -240,6 +253,7 @@ Needed once, before the first real deploy.
    | `AWS_DEPLOY_ROLE_ARN` | `github_deploy_role_arn_frontend` |
    | `S3_BUCKET` | `frontend_bucket_name` |
    | `VITE_API_BASE_URL` | `api_base_url` |
+   | `CLOUDFRONT_DISTRIBUTION_ID` | `cloudfront_distribution_id` — CD uses this to invalidate the cache after each deploy |
 
 4. **The first deploy is a chicken-and-egg step.** The instance boots and
    tries to pull `:latest` from an ECR repo that has no images yet, so
@@ -282,7 +296,8 @@ Ranked by how likely they are to cause real damage:
 1. **No authentication on the API.** Everything else here is mitigation
    for this one fact.
 2. **No database backups.** Nothing snapshots the EBS volume.
-3. **No TLS.** Every surface is plaintext HTTP.
+3. **No TLS on the API.** The frontend has HTTPS via CloudFront; the
+   EC2 API endpoint is still plaintext HTTP.
 4. **No schema migration tool**, and the current schema is reconstructed
    rather than original.
 5. **No remote Terraform state**, so two people applying will corrupt

@@ -206,6 +206,13 @@ variable "root_volume_size_gb" {
   default = 20
 }
 
+# --- CloudFront --------------------------------------------------------
+variable "cloudfront_price_class" {
+  type        = string
+  description = "CloudFront price class for the frontend distribution. PriceClass_100 (North America + Europe) is the cheapest tier and enough for this project's traffic; PriceClass_All adds Asia/South America/Australia edge locations at higher cost."
+  default     = "PriceClass_100"
+}
+
 # --- Bootstrapping ---------------------------------------------------
 # The very first `terraform apply` boots the instance before CD has ever
 # pushed an image, so ":latest" will not exist in ECR yet on a brand-new

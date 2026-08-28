@@ -196,6 +196,19 @@ resource "aws_iam_role_policy" "github_deploy_frontend" {
         ]
         Resource = ["${aws_s3_bucket.frontend.arn}/*"]
       },
+      {
+        # Lets CD bust the CloudFront cache for index.html after each
+        # sync, so a deploy shows up immediately instead of waiting out
+        # whatever TTL the cache policy would otherwise apply. Scoped to
+        # this one distribution — nothing else in the account.
+        Sid    = "InvalidateFrontendDistribution"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateInvalidation",
+          "cloudfront:GetInvalidation",
+        ]
+        Resource = [aws_cloudfront_distribution.frontend.arn]
+      },
     ]
   })
 }
