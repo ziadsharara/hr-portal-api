@@ -6,13 +6,28 @@
 # DEPLOYMENT.md for the before/after.
 #
 # The bucket is private now (Origin Access Control, not the old public
-# IP-conditioned policy), so the CloudFront Function below is what
-# re-implements api_allowed_cidrs at the edge — see
-# cloudfront_function.js.tftpl for why.
+# IP-conditioned policy), so the CloudFront Functions below are what
+# re-implement api_allowed_cidrs at the edge — see cloudfront_function.js.tftpl
+# for why.
 #
-# allow_public_api_access (variables.tf) controls whether that function
-# is attached at all — mirrors the dynamic "condition" toggle s3.tf used
-# to carry directly, back when the bucket's own policy did this job.
+# Both functions are always attached; allow_public_api_access
+# (variables.tf) is baked into their CODE as a runtime flag instead of
+# controlling whether they're attached at all. The S3-side function also
+# does the Vue Router SPA-fallback rewrite, which has to run on every
+# request regardless of that flag — and CloudFront allows only one
+# function per event type per behavior, so toggling attachment would have
+# meant either losing the rewrite while public, or duplicating it into a
+# second function kept in sync with the first.
+#
+# /api/* on this same distribution proxies to the EC2 backend (see the
+# second origin and ordered_cache_behavior below). This exists because
+# putting the frontend on HTTPS while the API stayed on plain HTTP turned
+# a merely-insecure setup into a BROKEN one: browsers block active mixed
+# content (fetch/XHR from an HTTPS page to an http:// URL) outright, so
+# every API call from the CloudFront-served frontend would otherwise
+# fail silently. Routing both through one HTTPS origin fixes that and
+# means the frontend build can go back to a relative VITE_API_BASE_URL
+# (/api) instead of an absolute cross-origin one — see DEPLOYMENT.md.
 
 resource "aws_cloudfront_origin_access_control" "frontend" {
   name                              = "${local.name_prefix}-frontend"
@@ -25,11 +40,24 @@ resource "aws_cloudfront_origin_access_control" "frontend" {
 resource "aws_cloudfront_function" "ip_allowlist" {
   name    = "${local.name_prefix}-frontend-ip-allowlist"
   runtime = "cloudfront-js-2.0"
-  comment = "Replaces the old aws:SourceIp S3 bucket-policy condition now that the bucket is private."
+  comment = "IP allowlist + SPA fallback rewrite for the S3 origin"
   publish = true
 
   code = templatefile("${path.module}/cloudfront_function.js.tftpl", {
-    cidrs = var.api_allowed_cidrs
+    cidrs             = var.api_allowed_cidrs
+    enforce_allowlist = !var.allow_public_api_access
+  })
+}
+
+resource "aws_cloudfront_function" "api_ip_allowlist" {
+  name    = "${local.name_prefix}-api-ip-allowlist"
+  runtime = "cloudfront-js-2.0"
+  comment = "IP allowlist for the /api/* origin, no SPA rewrite"
+  publish = true
+
+  code = templatefile("${path.module}/cloudfront_function_api.js.tftpl", {
+    cidrs             = var.api_allowed_cidrs
+    enforce_allowlist = !var.allow_public_api_access
   })
 }
 
@@ -39,12 +67,12 @@ resource "aws_cloudfront_distribution" "frontend" {
   default_root_object = "index.html"
   price_class         = var.cloudfront_price_class
 
-  # Off unless access is deliberately public: the IP-allowlist function
-  # only checks IPv4 (see cloudfront_function.js.tftpl), so enabling IPv6
-  # while that function is attached would be a silent bypass of
-  # api_allowed_cidrs for any viewer connecting over IPv6. Once
-  # allow_public_api_access is on, the function isn't attached at all, so
-  # there's no restriction left for an IPv6 viewer to bypass — and
+  # Off unless access is deliberately public: both CloudFront Functions'
+  # IP allowlist only checks IPv4 (see cloudfront_function.js.tftpl), so
+  # enabling IPv6 while enforce_allowlist is baked in as true would be a
+  # silent bypass of api_allowed_cidrs for any viewer connecting over
+  # IPv6. Once allow_public_api_access is on, enforce_allowlist is false
+  # and there's no restriction left for an IPv6 viewer to bypass — and
   # leaving IPv6 off in that case would just be an availability bug for
   # anyone on IPv6-only networks, the same failure mode s3.tf's
   # SourceArn/aws:SourceIp comment already covers for the old bucket
@@ -55,10 +83,40 @@ resource "aws_cloudfront_distribution" "frontend" {
     # The REST regional endpoint, not the website endpoint — Origin
     # Access Control only works against the S3 REST API. The website
     # endpoint (and the error_document trick it used for Vue Router's
-    # history mode) is gone; custom_error_response below replaces it.
+    # history mode) is gone; the SPA rewrite in the ip_allowlist
+    # CloudFront Function (below) replaces it.
     domain_name              = aws_s3_bucket.frontend.bucket_regional_domain_name
     origin_id                = "s3-frontend"
     origin_access_control_id = aws_cloudfront_origin_access_control.frontend.id
+  }
+
+  origin {
+    # CloudFront custom origins must be addressed by DNS name, not a bare
+    # IP. Deliberately built from aws_eip.backend.public_ip rather than
+    # aws_instance.backend.public_dns: the whole point of the Elastic IP
+    # (see ec2.tf) is that it's stable across an instance replacement,
+    # and this origin should be too — depending on the instance directly
+    # would make any future instance replacement (e.g. once the
+    # hr-portal-db ECR image gap is resolved) force a CloudFront update
+    # in lockstep for no reason. AWS's own public-DNS format for an EC2
+    # public IP is deterministic, so this needs no separate Route53
+    # record — but the format itself differs for us-east-1 (a legacy
+    # naming quirk: "compute-1", not "<region>.compute") versus every
+    # other region.
+    domain_name = "ec2-${replace(aws_eip.backend.public_ip, ".", "-")}.${data.aws_region.current.name == "us-east-1" ? "compute-1" : "${data.aws_region.current.name}.compute"}.amazonaws.com"
+    origin_id   = "ec2-backend"
+
+    custom_origin_config {
+      # http-only because the backend has no TLS listener (see ec2.tf /
+      # DEPLOYMENT.md's "no TLS on the API" gap) — CloudFront terminates
+      # HTTPS for the viewer and talks plain HTTP to this origin, which
+      # is exactly what fixes the mixed-content problem without needing
+      # a certificate on the EC2 instance itself.
+      origin_protocol_policy = "http-only"
+      http_port              = var.backend_port
+      https_port             = 443
+      origin_ssl_protocols   = ["TLSv1.2"]
+    }
   }
 
   default_cache_behavior {
@@ -74,29 +132,55 @@ resource "aws_cloudfront_distribution" "frontend" {
     # no-cache for index.html) — no custom cache policy needed.
     cache_policy_id = "658327ea-f89d-4fab-a63d-7e88639e58f6"
 
-    dynamic "function_association" {
-      for_each = var.allow_public_api_access ? [] : [1]
-
-      content {
-        event_type   = "viewer-request"
-        function_arn = aws_cloudfront_function.ip_allowlist.arn
-      }
+    # Always attached — enforce_allowlist inside the function's own code
+    # is what allow_public_api_access actually toggles. See the header
+    # comment on why this can't be a dynamic block instead.
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.ip_allowlist.arn
     }
   }
 
-  # A private bucket returns 403 (not 404) for a missing key, so both
-  # codes have to map to index.html for Vue Router's history mode to
-  # survive a hard refresh on a client-side route like /employees/42.
-  custom_error_response {
-    error_code         = 403
-    response_code      = 200
-    response_page_path = "/index.html"
-  }
+  ordered_cache_behavior {
+    path_pattern     = "/api/*"
+    target_origin_id = "ec2-backend"
 
-  custom_error_response {
-    error_code         = 404
-    response_code      = 200
-    response_page_path = "/index.html"
+    # The API needs the full HTTP verb set, not just GET/HEAD — it's a
+    # real Spring Boot backend (POST/PUT/PATCH/DELETE), not a static
+    # site.
+    allowed_methods = ["GET", "HEAD", "OPTIONS", "PUT", "POST", "PATCH", "DELETE"]
+    cached_methods  = ["GET", "HEAD"]
+    compress        = true
+
+    viewer_protocol_policy = "redirect-to-https"
+
+    # AWS managed "CachingDisabled": API responses are per-request and
+    # must never be served from the edge cache.
+    cache_policy_id = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+
+    # AWS managed "AllViewer": forwards every header, cookie, and query
+    # string through untouched, since this is a proxy to a real API, not
+    # a cacheable static asset — CachingOptimized (used above for S3)
+    # would strip most of that.
+    origin_request_policy_id = "216adef6-5c7f-47e4-b989-5492eafa07d3"
+
+    # Same edge-level IP allowlist as the frontend (via its own function,
+    # not the shared one — this one has no SPA rewrite). The API is
+    # exactly as sensitive as the frontend it sits behind (no auth
+    # either way), so it gets the same protection.
+    #
+    # Deliberately NOT a custom_error_response for 403/404 on this
+    # behavior: custom_error_response is distribution-wide in the AWS
+    # provider, not scoped per path pattern, so a 403/404->index.html
+    # mapping here would silently rewrite genuine API error responses
+    # (e.g. a real "employee not found" 404) into an HTML page instead of
+    # JSON. The S3 behavior's SPA fallback is handled inside its own
+    # CloudFront Function instead, precisely to avoid needing
+    # custom_error_response at the distribution level at all.
+    function_association {
+      event_type   = "viewer-request"
+      function_arn = aws_cloudfront_function.api_ip_allowlist.arn
+    }
   }
 
   restrictions {

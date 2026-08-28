@@ -1,39 +1,76 @@
-// Templated by cloudfront.tf's templatefile() call from var.api_allowed_cidrs
-// — this is the ONLY place that list is compiled into JS, so there is one
-// source of truth for who may reach the frontend. Runs on viewer-request,
-// so it gates cached responses too, not just origin fetches.
+// Templated by cloudfront.tf's templatefile() call. Attached to the S3
+// (default_cache_behavior) viewer-request only — the /api/* behavior uses
+// its own function (cloudfront_function_api.js.tftpl), since API requests
+// must never get the SPA rewrite below.
 //
-// This replaces the aws:SourceIp condition the S3 bucket policy used to
-// carry back when the bucket was public (see s3.tf) — CloudFront doesn't
-// support that condition, and by the time a request reaches S3 from
-// CloudFront it no longer carries the end user's IP.
+// Two independent jobs, both always present in the deployed code:
 //
-// IPv4 only. The distribution has is_ipv6_enabled = false, so an IPv6
-// viewer address here should not occur; if one ever does, ipToInt returns
-// null and the request is denied, not silently allowed.
+//   1. IP allowlist, gated at runtime by enforceAllowlist (baked in from
+//      var.allow_public_api_access) rather than by whether this function
+//      is attached at all — see the comment on enforceAllowlist for why
+//      that distinction matters.
+//   2. Vue Router history-mode fallback: rewrite any request that isn't
+//      for a literal file to /index.html, since the bucket is private
+//      now and a missing key returns 403, not a friendly fallback.
+//
+// IPv4 only for the allowlist. The distribution's is_ipv6_enabled follows
+// allow_public_api_access, so an IPv6 viewer address here should only
+// occur when the allowlist isn't being enforced anyway; if one ever
+// reaches this code path regardless, ipToInt returns null and the
+// request is denied, not silently allowed.
 function handler(event) {
     var request = event.request;
-    var viewerIp = event.viewer.ip;
-    var allowedCidrs = [
-%{ for cidr in cidrs ~}
-        "${cidr}",
-%{ endfor ~}
-    ];
 
-    for (var i = 0; i < allowedCidrs.length; i++) {
-        if (ipInCidr(viewerIp, allowedCidrs[i])) {
-            return request;
+    // Baked in at plan/apply time, NOT read from a variable at runtime —
+    // CloudFront Functions have no access to Terraform state. This has
+    // to be a runtime `if`, not whether the function is attached at all:
+    // the SPA rewrite below must always run regardless of
+    // allow_public_api_access, and CloudFront allows only one function
+    // per event type per behavior, so "attach a different function when
+    // public" was not an option without duplicating the rewrite logic
+    // into two files and keeping them in sync.
+    var enforceAllowlist = %{ if enforce_allowlist }true%{ else }false%{ endif };
+
+    if (enforceAllowlist) {
+        var viewerIp = event.viewer.ip;
+        var allowedCidrs = [
+%{ for cidr in cidrs ~}
+            "${cidr}",
+%{ endfor ~}
+        ];
+
+        var allowed = false;
+        for (var i = 0; i < allowedCidrs.length; i++) {
+            if (ipInCidr(viewerIp, allowedCidrs[i])) {
+                allowed = true;
+                break;
+            }
+        }
+
+        if (!allowed) {
+            return {
+                statusCode: 403,
+                statusDescription: "Forbidden",
+                body: {
+                    encoding: "text",
+                    data: "Forbidden"
+                }
+            };
         }
     }
 
-    return {
-        statusCode: 403,
-        statusDescription: "Forbidden",
-        body: {
-            encoding: "text",
-            data: "Forbidden"
-        }
-    };
+    // A request "looks like a real file" if its last path segment
+    // contains a dot (asset.js, favicon.ico, ...). Anything else —
+    // including "/" itself — is a client-side route and has to receive
+    // index.html for Vue Router to take over, rather than a 403 from the
+    // now-private S3 origin.
+    var uri = request.uri;
+    var lastSegment = uri.substring(uri.lastIndexOf("/") + 1);
+    if (lastSegment.indexOf(".") === -1) {
+        request.uri = "/index.html";
+    }
+
+    return request;
 }
 
 function ipInCidr(ip, cidr) {

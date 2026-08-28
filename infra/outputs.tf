@@ -1,5 +1,5 @@
 output "frontend_url" {
-  description = "The Vue app, served over HTTPS via CloudFront (default *.cloudfront.net certificate — no custom domain yet). Reachable only from api_allowed_cidrs, enforced by the CloudFront Function in cloudfront.tf."
+  description = "The Vue app, served over HTTPS via CloudFront (default *.cloudfront.net certificate — no custom domain yet). /api/* on this same URL proxies to the backend. Reachable only from api_allowed_cidrs, enforced by the CloudFront Functions in cloudfront.tf."
   value       = "https://${aws_cloudfront_distribution.frontend.domain_name}"
 }
 
@@ -14,7 +14,7 @@ output "cloudfront_distribution_id" {
 }
 
 output "api_base_url" {
-  description = "Set this as the VITE_API_BASE_URL repository variable in hr-portal-frontend. It is baked into the Vue bundle at build time, so changing it requires a frontend rebuild, not just a redeploy."
+  description = "The API's direct EC2 address — plain HTTP, for debugging/direct access only. NOT what VITE_API_BASE_URL should be set to any more: the frontend is served over HTTPS via CloudFront, and a browser blocks active mixed content (fetch/XHR from HTTPS to a plain-HTTP URL) outright. cloudfront.tf routes /api/* on the SAME distribution to this backend instead, so VITE_API_BASE_URL should be the relative path \"/api\" — see DEPLOYMENT.md."
   value       = "http://${aws_eip.backend.public_ip}:${var.backend_port}/api"
 }
 
