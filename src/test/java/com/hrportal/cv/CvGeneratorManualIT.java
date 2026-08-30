@@ -105,33 +105,43 @@ class CvGeneratorManualIT {
         Files.write(Path.of(outPath), pptx);
         System.out.println("WROTE_CV_BYTES=" + pptx.length + " TO=" + outPath);
 
-        assertNoDuplicateShapeIds(pptx);
-    }
-
-    /**
-     * Parses every ppt/slides/slideN.xml entry in the .pptx and fails if any
-     * <p:cNvPr id="..."> value repeats on the SAME slide — the concrete
-     * violation PowerPoint's strict validator rejected. Also reports (via
-     * the failure message) any id that repeats across DIFFERENT slides,
-     * since this generator's fix assigns ids from one global counter and a
-     * cross-slide repeat would mean the counter regressed, even though
-     * same-slide-only uniqueness is the strictly necessary condition.
-     */
-    private static void assertNoDuplicateShapeIds(byte[] pptx) throws IOException {
-        Pattern idPattern = Pattern.compile("<p:cNvPr id=\"(\\d+)\"");
-        Map<String, List<String>> idToSlides = new HashMap<>();
-
+        Map<String, String> slideXml = new HashMap<>();      // ppt/slides/slideN.xml -> content
+        Map<String, String> slideRelsXml = new HashMap<>();  // ppt/slides/_rels/slideN.xml.rels -> content
         try (ZipInputStream zip = new ZipInputStream(new ByteArrayInputStream(pptx))) {
             ZipEntry entry;
             while ((entry = zip.getNextEntry()) != null) {
-                if (!entry.getName().matches("ppt/slides/slide\\d+\\.xml")) continue;
-                String xml = new String(zip.readAllBytes(), StandardCharsets.UTF_8);
-                Matcher m = idPattern.matcher(xml);
-                while (m.find()) {
-                    String id = m.group(1);
-                    if ("1".equals(id)) continue; // root spTree group shape id — expected on every slide
-                    idToSlides.computeIfAbsent(id, k -> new ArrayList<>()).add(entry.getName());
+                String name = entry.getName();
+                if (name.matches("ppt/slides/slide\\d+\\.xml")) {
+                    slideXml.put(name, new String(zip.readAllBytes(), StandardCharsets.UTF_8));
+                } else if (name.matches("ppt/slides/_rels/slide\\d+\\.xml\\.rels")) {
+                    slideRelsXml.put(name, new String(zip.readAllBytes(), StandardCharsets.UTF_8));
                 }
+            }
+        }
+
+        assertNoDuplicateShapeIds(slideXml);
+        assertNoBrokenSvgBlipReferences(slideXml, slideRelsXml);
+    }
+
+    /**
+     * Fails if any <p:cNvPr id="..."> value repeats on the SAME slide — the
+     * concrete violation PowerPoint's strict validator rejected. Also
+     * reports (via the failure message) any id that repeats across
+     * DIFFERENT slides, since this generator's fix assigns ids from one
+     * global counter and a cross-slide repeat would mean the counter
+     * regressed, even though same-slide-only uniqueness is the strictly
+     * necessary condition.
+     */
+    private static void assertNoDuplicateShapeIds(Map<String, String> slideXml) {
+        Pattern idPattern = Pattern.compile("<p:cNvPr id=\"(\\d+)\"");
+        Map<String, List<String>> idToSlides = new HashMap<>();
+
+        for (Map.Entry<String, String> e : slideXml.entrySet()) {
+            Matcher m = idPattern.matcher(e.getValue());
+            while (m.find()) {
+                String id = m.group(1);
+                if ("1".equals(id)) continue; // root spTree group shape id — expected on every slide
+                idToSlides.computeIfAbsent(id, k -> new ArrayList<>()).add(e.getKey());
             }
         }
 
@@ -151,6 +161,56 @@ class CvGeneratorManualIT {
         assertTrue(crossSlideDuplicates.isEmpty(),
                 "Found shape id(s) duplicated across different slides — not the strict failure " +
                         "condition, but indicates the global id counter regressed: " + crossSlideDuplicates);
+    }
+
+    /**
+     * Fails if any <asvg:svgBlip r:embed="X"> in a slide references an rId
+     * that either doesn't exist in that slide's .rels at all, or resolves
+     * to something other than a .svg target. importContent() was found to
+     * copy a picture shape's primary <a:blip r:embed> relationship
+     * correctly but leave the SVG icon extension's r:embed as the literal
+     * original rId from the source slide — which then coincidentally
+     * collides with whatever fresh id the primary PNG relationship got
+     * assigned in the destination, so it silently resolves to the wrong
+     * (PNG) relationship instead of a missing one. Real PowerPoint's
+     * validator rejects that; LibreOffice and python-pptx don't notice.
+     * The fix strips the broken extension outright, so this should find
+     * none — if it does, the extension came back without being repaired.
+     */
+    private static void assertNoBrokenSvgBlipReferences(Map<String, String> slideXml,
+                                                          Map<String, String> slideRelsXml) {
+        Pattern svgBlipPattern = Pattern.compile("<asvg:svgBlip[^>]*r:embed=\"(rId\\d+)\"");
+        Pattern relPattern = Pattern.compile("<Relationship Id=\"(rId\\d+)\"[^>]*Target=\"([^\"]*)\"");
+
+        List<String> broken = new ArrayList<>();
+        for (Map.Entry<String, String> e : slideXml.entrySet()) {
+            Matcher svgBlipMatcher = svgBlipPattern.matcher(e.getValue());
+            if (!svgBlipMatcher.find()) continue; // no svgBlip extension on this slide at all — fine
+
+            String slideName = e.getKey().substring(e.getKey().lastIndexOf('/') + 1);
+            String relsPath = "ppt/slides/_rels/" + slideName + ".rels";
+            String relsXml = slideRelsXml.getOrDefault(relsPath, "");
+
+            Map<String, String> ridToTarget = new HashMap<>();
+            Matcher relMatcher = relPattern.matcher(relsXml);
+            while (relMatcher.find()) {
+                ridToTarget.put(relMatcher.group(1), relMatcher.group(2));
+            }
+
+            do {
+                String rid = svgBlipMatcher.group(1);
+                String target = ridToTarget.get(rid);
+                if (target == null) {
+                    broken.add(e.getKey() + ": svgBlip r:embed=\"" + rid + "\" has no matching relationship in " + relsPath);
+                } else if (!target.toLowerCase().endsWith(".svg")) {
+                    broken.add(e.getKey() + ": svgBlip r:embed=\"" + rid + "\" resolves to \"" + target + "\", not an .svg");
+                }
+            } while (svgBlipMatcher.find());
+        }
+
+        assertTrue(broken.isEmpty(),
+                "Found svgBlip extension(s) pointing at the wrong or a missing relationship — " +
+                        "the second real cause of PowerPoint rejecting the file as corrupt: " + broken);
     }
 
     private static Experience exp(String org, String country, String industry, String scope,

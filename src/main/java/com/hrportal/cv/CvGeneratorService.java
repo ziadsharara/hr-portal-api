@@ -149,6 +149,7 @@ public class CvGeneratorService {
                 // gets its own real per-employee blocks added below.
                 for (XSLFShape shape : newSlide.getShapes()) {
                     reassignShapeIds(shape.getXmlObject(), idCounter);
+                    stripBrokenSvgBlipExtensions(shape.getXmlObject());
                 }
 
                 replaceTokensOnSlide(newSlide, headerTokens(employee, pageIndex + 1, totalPages));
@@ -303,6 +304,56 @@ public class CvGeneratorService {
                 tt = cursor.toNextToken();
             }
         }
+    }
+
+    /**
+     * The stencil's logo icon shape ("Graphic N") stores two relationships
+     * for the same image: a raster PNG on the plain <a:blip r:embed>, and a
+     * sharper SVG on a Microsoft extension inside <a:extLst> —
+     * <asvg:svgBlip r:embed>. importContent() correctly copies the primary
+     * blip's relationship (renumbering its r:embed to a fresh rId in the
+     * destination slide) but does NOT walk into extLst to do the same for
+     * the svgBlip extension — its r:embed is left as the literal original
+     * rId from the source slide. That id now happens to coincide with
+     * whatever fresh id importContent() assigned the primary PNG
+     * relationship in the destination, so the extension silently resolves
+     * to the wrong relationship (a PNG through what's declared as an SVG
+     * reference) instead of a missing/dangling one — real PowerPoint's
+     * stricter validator rejects this; LibreOffice and python-pptx don't
+     * notice (confirmed 2026-08-30 against a real 3-page CV pulled from
+     * production after the shape-id fix alone was deployed — PowerPoint
+     * still rejected it, and this was the reason).
+     *
+     * Simplest correct fix: drop the broken extension outright rather than
+     * reimplementing relationship copying for it. The plain PNG blip is
+     * already valid post-import, so the shape still renders — just via the
+     * PNG fallback instead of the crisper SVG — on every page 2+ (page 1 is
+     * edited in place from the template, never re-imported, so it keeps
+     * its original, correctly-paired SVG relationship untouched).
+     */
+    private void stripBrokenSvgBlipExtensions(XmlObject xml) {
+        // XmlObject.selectPath() would need Saxon on the classpath, which
+        // this project doesn't depend on — walk with XmlCursor instead, the
+        // same no-extra-dependency approach used elsewhere in this class.
+        // Restart the walk after each removal rather than trying to keep a
+        // single cursor valid across a mutation mid-traversal.
+        boolean removedSomething;
+        do {
+            removedSomething = false;
+            try (XmlCursor cursor = xml.newCursor()) {
+                XmlCursor.TokenType tt = cursor.toNextToken();
+                while (tt != XmlCursor.TokenType.ENDDOC) {
+                    if (tt == XmlCursor.TokenType.START && "svgBlip".equals(cursor.getName().getLocalPart())) {
+                        if (cursor.toParent()) { // the wrapping <a:ext>
+                            cursor.removeXml();
+                            removedSomething = true;
+                        }
+                        break;
+                    }
+                    tt = cursor.toNextToken();
+                }
+            }
+        } while (removedSomething);
     }
 
     private void replaceTokensInRawXml(XmlObject xml, Map<String, String> values) {
