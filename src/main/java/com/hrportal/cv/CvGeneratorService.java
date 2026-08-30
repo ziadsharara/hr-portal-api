@@ -8,6 +8,7 @@ import org.apache.xmlbeans.XmlObject;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.stereotype.Service;
 
+import javax.xml.namespace.QName;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -16,6 +17,7 @@ import java.time.Period;
 import java.time.format.DateTimeFormatter;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Generates one employee's CV as a .pptx from the tokenized master template
@@ -66,6 +68,24 @@ public class CvGeneratorService {
             XSLFSlide pageNStencil = ppt.getSlides().get(1);
             XSLFSlideLayout pageNLayout = pageNStencil.getSlideLayout();
 
+            // Every experience-block clone (addBlock(), via .set()) and every
+            // page-2+ frame shape (importContent()) carries forward its
+            // source shape's original <p:cNvPr id="..."> verbatim — neither
+            // operation reassigns it. With only 3 block masters and 1 stencil
+            // slide reused across every row/page, that produces duplicate
+            // shape ids, including on the SAME slide whenever a page has two
+            // rows that both use the same master (e.g. a PAIR's left half
+            // and a following SOLO both come from blockLeftXml). LibreOffice
+            // opens files with duplicate ids without complaint; real
+            // PowerPoint's stricter validator rejects the whole file as
+            // corrupt (confirmed 2026-08-30 by generating a real multi-page
+            // CV and finding id="68" duplicated on a single slide). Fix:
+            // maintain one counter for the whole generation run, seeded
+            // above the highest id already present in the template, and
+            // reassign a fresh id to every cNvPr on every shape added via
+            // either cloning path.
+            AtomicInteger idCounter = new AtomicInteger(findMaxShapeId(page1Frame, pageNStencil));
+
             // Capture the 3 block masters as independent XML copies BEFORE
             // any slide removal, so cloning rows later never depends on the
             // stencil slide still being present in the presentation.
@@ -114,7 +134,8 @@ public class CvGeneratorService {
             removeBlockMasterShapes(page1Frame);
             replaceTokensOnSlide(page1Frame, headerTokens(employee, 1, totalPages));
             addRowsToSlide(page1Frame, pages.get(0), true,
-                    blockFullXml, fullRows, fullCols, blockLeftXml, leftRows, leftCols, blockRightXml, rightRows, rightCols);
+                    blockFullXml, fullRows, fullCols, blockLeftXml, leftRows, leftCols, blockRightXml, rightRows, rightCols,
+                    idCounter);
 
             // --- PAGES 2..N: same-package duplicate of the stencil's layout+content ---
             for (int pageIndex = 1; pageIndex < pages.size(); pageIndex++) {
@@ -122,9 +143,18 @@ public class CvGeneratorService {
                 newSlide.importContent(pageNStencil);
                 removeBlockMasterShapes(newSlide); // strip the 3 tokenized masters importContent just copied in
 
+                // Every shape importContent() just brought in (logo,
+                // pagination label, etc.) still carries the stencil's
+                // original ids — reassign fresh ones before this slide
+                // gets its own real per-employee blocks added below.
+                for (XSLFShape shape : newSlide.getShapes()) {
+                    reassignShapeIds(shape.getXmlObject(), idCounter);
+                }
+
                 replaceTokensOnSlide(newSlide, headerTokens(employee, pageIndex + 1, totalPages));
                 addRowsToSlide(newSlide, pages.get(pageIndex), false,
-                        blockFullXml, fullRows, fullCols, blockLeftXml, leftRows, leftCols, blockRightXml, rightRows, rightCols);
+                        blockFullXml, fullRows, fullCols, blockLeftXml, leftRows, leftCols, blockRightXml, rightRows, rightCols,
+                        idCounter);
             }
 
             // Remove the stencil now — it was only ever a content source for
@@ -148,14 +178,15 @@ public class CvGeneratorService {
     private void addRowsToSlide(XSLFSlide slide, CvLayoutEngine.Page page, boolean isPage1,
                                  XmlObject blockFullXml, int fullRows, int fullCols,
                                  XmlObject blockLeftXml, int leftRows, int leftCols,
-                                 XmlObject blockRightXml, int rightRows, int rightCols) {
+                                 XmlObject blockRightXml, int rightRows, int rightCols,
+                                 AtomicInteger idCounter) {
         for (int rowIndex = 0; rowIndex < page.rows.size(); rowIndex++) {
             CvLayoutEngine.Row row = page.rows.get(rowIndex);
             long top = CvGeometry.rowTop(isPage1 ? 0 : 1, rowIndex);
 
             if (row.type == CvLayoutEngine.RowType.FULL) {
                 addBlock(slide, blockFullXml.copy(), fullRows, fullCols, row.left,
-                        CvGeometry.FULL_LEFT, top, CvGeometry.FULL_WIDTH, CvGeometry.FULL_HEIGHT);
+                        CvGeometry.FULL_LEFT, top, CvGeometry.FULL_WIDTH, CvGeometry.FULL_HEIGHT, idCounter);
             } else if (row.type == CvLayoutEngine.RowType.SOLO) {
                 // Orphaned short-scope experience, no pairing partner —
                 // confirmed against real ground truth (the trailing "KIMA"
@@ -163,12 +194,12 @@ public class CvGeneratorService {
                 // renders alone in the HALF-LEFT slot, right half stays
                 // empty. NOT promoted to full-width.
                 addBlock(slide, blockLeftXml.copy(), leftRows, leftCols, row.left,
-                        CvGeometry.HALF_LEFT_LEFT, top, CvGeometry.HALF_LEFT_WIDTH, CvGeometry.HALF_LEFT_HEIGHT);
+                        CvGeometry.HALF_LEFT_LEFT, top, CvGeometry.HALF_LEFT_WIDTH, CvGeometry.HALF_LEFT_HEIGHT, idCounter);
             } else {
                 addBlock(slide, blockLeftXml.copy(), leftRows, leftCols, row.left,
-                        CvGeometry.HALF_LEFT_LEFT, top, CvGeometry.HALF_LEFT_WIDTH, CvGeometry.HALF_LEFT_HEIGHT);
+                        CvGeometry.HALF_LEFT_LEFT, top, CvGeometry.HALF_LEFT_WIDTH, CvGeometry.HALF_LEFT_HEIGHT, idCounter);
                 addBlock(slide, blockRightXml.copy(), rightRows, rightCols, row.right,
-                        CvGeometry.HALF_RIGHT_LEFT, top, CvGeometry.HALF_RIGHT_WIDTH, CvGeometry.HALF_RIGHT_HEIGHT);
+                        CvGeometry.HALF_RIGHT_LEFT, top, CvGeometry.HALF_RIGHT_WIDTH, CvGeometry.HALF_RIGHT_HEIGHT, idCounter);
             }
         }
     }
@@ -187,12 +218,16 @@ public class CvGeneratorService {
 
     /** Clones one experience block from a captured master XML copy, positions it, fills its 7 tokens. */
     private void addBlock(XSLFSlide slide, XmlObject blockXmlCopy, int rows, int cols, CvLayoutEngine.ExperienceBlock data,
-                           long left, long top, long width, long height) {
+                           long left, long top, long width, long height, AtomicInteger idCounter) {
         XSLFTable clone = slide.createTable(rows, cols);
         // Copy the master's row heights / column widths / cell formatting by
         // importing its XML directly rather than rebuilding cell-by-cell —
         // simplest reliable way to keep styling identical.
         clone.getXmlObject().set(blockXmlCopy);
+        // .set() above also overwrote the freshly-created table's own shape
+        // id with the master's original one — every clone of the same
+        // master would otherwise carry that same id. Reassign now.
+        reassignShapeIds(clone.getXmlObject(), idCounter);
         clone.setAnchor(new java.awt.geom.Rectangle2D.Double(
                 left / 12700.0, top / 12700.0, width / 12700.0, height / 12700.0));
 
@@ -212,6 +247,62 @@ public class CvGeneratorService {
         // clone.getXmlObject() — the actual live XML tree, post-.set() —
         // directly with an XmlCursor instead.
         replaceTokensInRawXml(clone.getXmlObject(), values);
+    }
+
+    /**
+     * Highest <p:cNvPr id="..."> found across the given slides' shape trees
+     * (walked recursively, so nested group shapes are covered too). Used to
+     * seed the id counter above anything already in the template so newly
+     * assigned ids can never collide with pre-existing ones.
+     */
+    private int findMaxShapeId(XSLFSlide... slides) {
+        int max = 0;
+        for (XSLFSlide slide : slides) {
+            for (XSLFShape shape : slide.getShapes()) {
+                max = Math.max(max, findMaxShapeId(shape.getXmlObject()));
+            }
+        }
+        return max;
+    }
+
+    private int findMaxShapeId(XmlObject xml) {
+        int max = 0;
+        try (XmlCursor cursor = xml.newCursor()) {
+            XmlCursor.TokenType tt = cursor.toNextToken();
+            while (tt != XmlCursor.TokenType.ENDDOC) {
+                if (tt == XmlCursor.TokenType.START && "cNvPr".equals(cursor.getName().getLocalPart())) {
+                    String idAttr = cursor.getAttributeText(new QName("id"));
+                    if (idAttr != null) {
+                        try {
+                            max = Math.max(max, Integer.parseInt(idAttr));
+                        } catch (NumberFormatException ignored) {
+                            // non-numeric id, shouldn't happen in a valid template
+                        }
+                    }
+                }
+                tt = cursor.toNextToken();
+            }
+        }
+        return max;
+    }
+
+    /**
+     * Walks every <p:cNvPr> in the given shape's XML — including any nested
+     * inside a group shape — and assigns it a fresh id from the shared
+     * counter. Every clone-via-.set() and every importContent() import
+     * carries its source's original id(s) forward verbatim; this is what
+     * makes each newly-added shape unique again afterward.
+     */
+    private void reassignShapeIds(XmlObject xml, AtomicInteger idCounter) {
+        try (XmlCursor cursor = xml.newCursor()) {
+            XmlCursor.TokenType tt = cursor.toNextToken();
+            while (tt != XmlCursor.TokenType.ENDDOC) {
+                if (tt == XmlCursor.TokenType.START && "cNvPr".equals(cursor.getName().getLocalPart())) {
+                    cursor.setAttributeText(new QName("id"), String.valueOf(idCounter.incrementAndGet()));
+                }
+                tt = cursor.toNextToken();
+            }
+        }
     }
 
     private void replaceTokensInRawXml(XmlObject xml, Map<String, String> values) {
@@ -243,21 +334,21 @@ public class CvGeneratorService {
                 year, x.getRole(), x.getDuration());
     }
 
-    private Map<String, String> headerTokens(Employee e, int page, int totalPages) {
+    private Map<String, String> headerTokens(Employee employee, int page, int totalPages) {
         String age = "";
-        if (e.getDateOfBirth() != null) {
-            age = Period.between(e.getDateOfBirth(), LocalDate.now()).getYears() + " Years";
+        if (employee.getDateOfBirth() != null) {
+            age = Period.between(employee.getDateOfBirth(), LocalDate.now()).getYears() + " Years";
         }
         return Map.ofEntries(
-                Map.entry("{{NAME}}", nullToDash(e.getName())),
-                Map.entry("{{CV_TITLE}}", nullToDash(e.getCvTitle())),
-                Map.entry("{{POSITION}}", nullToDash(e.getPosition())),
-                Map.entry("{{NATIONALITY}}", nullToDash(e.getNationality())),
-                Map.entry("{{LANGUAGES}}", nullToDash(e.getLanguages())),
+                Map.entry("{{NAME}}", nullToDash(employee.getName())),
+                Map.entry("{{CV_TITLE}}", nullToDash(employee.getCvTitle())),
+                Map.entry("{{POSITION}}", nullToDash(employee.getPosition())),
+                Map.entry("{{NATIONALITY}}", nullToDash(employee.getNationality())),
+                Map.entry("{{LANGUAGES}}", nullToDash(employee.getLanguages())),
                 Map.entry("{{AGE}}", age),
-                Map.entry("{{EDUCATION}}", nullToDash(e.getEducation())),
-                Map.entry("{{EXPERIENCE_YEARS}}", nullToDash(e.getExperienceYears())),
-                Map.entry("{{CERTIFICATION}}", nullToDash(e.getCertificates())),
+                Map.entry("{{EDUCATION}}", nullToDash(employee.getEducation())),
+                Map.entry("{{EXPERIENCE_YEARS}}", nullToDash(employee.getExperienceYears())),
+                Map.entry("{{CERTIFICATION}}", nullToDash(employee.getCertificates())),
                 Map.entry("{{PAGE}}", String.valueOf(page)),
                 Map.entry("{{TOTAL_PAGES}}", String.valueOf(totalPages))
         );
