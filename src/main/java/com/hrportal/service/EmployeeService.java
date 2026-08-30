@@ -165,10 +165,4 @@ public class EmployeeService {
         );
         return new ResponseEntity<>(response, HttpStatus.OK);
     }
-
-//    /** Used by ExperienceService to attach an experience to its employee. */
-//    @Transactional(readOnly = true)
-//    public Employee getEntityOrThrow(Integer companyCode) {
-//        return findOrThrow(companyCode);
-//    }
 }

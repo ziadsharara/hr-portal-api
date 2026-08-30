@@ -56,7 +56,7 @@ public class EmployeeController {
         return employeeService.updateEmployeeStatus(companyCode, req.getStatus());
     }
 
-    // Bulk employee Excel import — create-only, see EmployeeService.importEmployees.
+    // Bulk employee Excel import — create-only
     @PostMapping("/import")
     public ResponseEntity<EmployeeImportResponse> importEmployees(@RequestParam("file") MultipartFile file) {
         return employeeService.importEmployees(file);

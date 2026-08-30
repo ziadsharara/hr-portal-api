@@ -2,7 +2,7 @@ package com.hrportal.excel;
 
 import java.time.LocalDate;
 
-/** One employee row from the employee Excel sheet, after column mapping. Values are trimmed strings or null. */
+// One employee row from the employee Excel sheet, after column mapping. Values are trimmed strings or null.
 public record ParsedEmployeeRow(
         int rowNumber,
         Integer companyCode,

@@ -6,12 +6,11 @@ import org.apache.poi.ss.usermodel.Color;
 import org.apache.poi.ss.usermodel.DateUtil;
 import org.apache.poi.ss.usermodel.Row;
 import org.apache.poi.xssf.usermodel.XSSFColor;
+import org.apache.poi.ss.usermodel.Sheet;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 
 /**
  * Shared helpers for reading HR's Excel workbooks. The source files are
@@ -34,12 +33,12 @@ final class ExcelUtil {
      * (case-insensitive, trimmed) among its cell values. Returns the 0-based
      * row index, or -1 if no such row is found.
      */
-    static int findHeaderRow(org.apache.poi.ss.usermodel.Sheet sheet, int maxRowsToScan, List<String> requiredMarkers) {
+    static int findHeaderRow(Sheet sheet, int maxRowsToScan, List<String> requiredMarkers) {
         int limit = Math.min(maxRowsToScan, sheet.getLastRowNum() + 1);
         for (int r = 0; r <= limit; r++) {
             Row row = sheet.getRow(r);
             if (row == null) continue;
-            java.util.Set<String> normalizedCells = new java.util.HashSet<>();
+            Set<String> normalizedCells = new HashSet<>();
             for (Cell cell : row) {
                 String v = cellString(cell);
                 if (v != null && !v.isBlank()) {

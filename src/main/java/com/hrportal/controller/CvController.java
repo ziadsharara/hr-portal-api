@@ -42,7 +42,7 @@ public class CvController {
                 experienceRepository.findByEmployee_CompanyCodeOrderByStartDateDesc(companyCode);
 
         byte[] pptx = cvGeneratorService.generate(employee.get(), experiences);
-        String filename = safeFilename(employee.get().getName()) + "-CV.pptx";
+        String filename = safeFilename(employee.get().getName()) + "-" + employee.get().getCompanyCode() + "-CV.pptx";
 
         return ResponseEntity.ok()
                 .contentType(PPTX_MEDIA_TYPE)
