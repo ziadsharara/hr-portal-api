@@ -21,8 +21,7 @@ WORKDIR /app
 
 # Run as a dedicated non-root user rather than the image's default root.
 RUN addgroup -S app && adduser -S app -G app
-COPY --from=build /build/target/app.jar ./app.jar
-RUN chown app:app ./app.jar
+COPY --chown=app:app --from=build /build/target/app.jar ./app.jar
 USER app
 
 # Actual environment-specific config (DB_URL, DB_USERNAME, DB_PASSWORD,
